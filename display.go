@@ -53,12 +53,27 @@ func healthLabelZH(health string) string {
 	case "cooldown", "quota_issue", "quota_exhausted":
 		return "额度问题"
 	case "soft_exhausted":
-		// Deprecated: local 2M alone is not exhaustion.
+		// Deprecated compatibility label (not used for new marks).
 		return "高用量(旧)"
 	case "unknown", "":
 		return "未知"
 	default:
 		return health
+	}
+}
+
+func statusKindLabelZH(kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "active":
+		return "正常"
+	case "disabled":
+		return "已停用"
+	case "quota_issue":
+		return "额度问题"
+	case "high_usage":
+		return "高用量"
+	default:
+		return kind
 	}
 }
 
@@ -99,6 +114,9 @@ func enrichAccountDisplay(a *accountQuota) {
 		return
 	}
 	a.HealthLabel = healthLabelZH(a.Health)
+	if a.StatusLabel == "" {
+		a.StatusLabel = statusKindLabelZH(a.StatusKind)
+	}
 	a.ReasonLabel = reasonLabelZH(a.Reason)
 	a.Tokens24hM = formatTokensM(a.Tokens24h)
 	a.LimitTokensM = formatTokensM(a.LimitTokens)
@@ -107,6 +125,8 @@ func enrichAccountDisplay(a *accountQuota) {
 	a.FailureAtCN = formatTimeCN(a.FailureAt)
 	a.RecoverAtCN = formatTimeCN(a.RecoverAt)
 	a.LastUsageAtCN = formatTimeCN(a.LastUsageAt)
+	a.EmailMasked = maskEmailDisplay(a.Email)
+	a.AuthFileMasked = maskAtAndAfter(a.AuthFile)
 	if a.ActionHint == "" && a.SuggestDisable {
 		a.ActionHint = "日志含额度错误，建议停用"
 	}

@@ -25,18 +25,8 @@ func defaultStatePath() string {
 	if v := strings.TrimSpace(os.Getenv("GROK_QUOTA_STATE_PATH")); v != "" {
 		return v
 	}
-	// Prefer live plugins dir next to the loaded DLL when present.
-	candidates := []string{
-		filepath.Join("plugins", "grok-quota-state.json"),
-		`E:\CPA\plugins\grok-quota-state.json`,
-	}
-	if cwd, err := os.Getwd(); err == nil {
-		candidates = append([]string{
-			filepath.Join(cwd, "plugins", "grok-quota-state.json"),
-			filepath.Clean(filepath.Join(cwd, "..", "plugins", "grok-quota-state.json")),
-		}, candidates...)
-	}
-	for _, c := range candidates {
+	// Prefer an existing plugins directory under CPA roots.
+	for _, c := range underRoots("plugins", "grok-quota-state.json") {
 		dir := filepath.Dir(c)
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
 			return c

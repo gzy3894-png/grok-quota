@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,6 +144,18 @@ VALUES (5,?, 'c3','xai','xai-c@x.com.json','c@x.com', 3100000, 0, 0, '', '', 0, 
 	}
 	if !c3.OverReference {
 		t.Fatalf("c3 should be over reference")
+	}
+	if c3.ShowReference {
+		t.Fatalf("c3 should hide 2M reference once over")
+	}
+	if c3.StatusKind != "high_usage" {
+		t.Fatalf("c3 status_kind=%s want high_usage", c3.StatusKind)
+	}
+	if c3.Remark == "" {
+		t.Fatalf("c3 needs remark explaining high usage")
+	}
+	if c3.EmailMasked == "" || !containsAtMask(c3.EmailMasked) {
+		t.Fatalf("c3 email should be masked, got %q", c3.EmailMasked)
 	}
 	if snap.Summary.SoftExhaustedAccounts != 0 {
 		t.Fatalf("soft_exhausted_accounts should be 0, got %d", snap.Summary.SoftExhaustedAccounts)
@@ -288,4 +301,8 @@ func mustExec(t *testing.T, db *sql.DB, q string, args ...any) {
 	if _, err := db.Exec(q, args...); err != nil {
 		t.Fatalf("exec: %v", err)
 	}
+}
+
+func containsAtMask(s string) bool {
+	return strings.Contains(s, "@***")
 }

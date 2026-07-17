@@ -28,21 +28,9 @@ func detectAuthDir() string {
 	if v := strings.TrimSpace(os.Getenv("CPA_AUTH_DIR")); v != "" {
 		return v
 	}
-	candidates := []string{
-		filepath.Join("auths"),
-		`E:\CPA\auths`,
-	}
-	if cwd, err := os.Getwd(); err == nil {
-		candidates = append([]string{
-			filepath.Join(cwd, "auths"),
-			filepath.Clean(filepath.Join(cwd, "..", "auths")),
-			filepath.Clean(filepath.Join(cwd, "..", "CPA", "auths")),
-		}, candidates...)
-	}
-	for _, c := range candidates {
-		if info, err := os.Stat(c); err == nil && info.IsDir() {
-			return c
-		}
+	candidates := underRoots("auths")
+	if found := firstExistingDir(candidates...); found != "" {
+		return found
 	}
 	return filepath.Join("auths")
 }

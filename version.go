@@ -2,5 +2,5 @@ package main
 
 const (
 	pluginName    = "grok-quota"
-	pluginVersion = "0.1.9"
+	pluginVersion = "0.1.14"
 )

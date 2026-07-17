@@ -74,15 +74,27 @@ type accountQuota struct {
 	// SoftExhausted is deprecated: local rolling usage alone never marks full.
 	// Kept for API compatibility; always false for new snapshots.
 	SoftExhausted bool `json:"soft_exhausted"`
-	// OverReference means tokens_24h exceeds the local reference baseline (default 2M)
+	// OverReference means tokens_24h exceeds the reference baseline (default 2M)
 	// without implying official exhaustion.
 	OverReference bool `json:"over_reference"`
 	// SuggestDisable is true when usage_events prove a quota problem and the
 	// account is still enabled in the live pool.
 	SuggestDisable bool   `json:"suggest_disable"`
 	ActionHint     string `json:"action_hint,omitempty"`
-	// ReferenceTokens is the local baseline (default 2M), not an official cap.
-	ReferenceTokens int64   `json:"reference_tokens"`
+	// Remark is operator-facing explanation (high usage / quota issue / disabled).
+	Remark string `json:"remark,omitempty"`
+	// StatusKind is a single filter-friendly code for the console.
+	// active | disabled | quota_issue | high_usage
+	StatusKind      string `json:"status_kind,omitempty"`
+	StatusLabel     string `json:"status_label,omitempty"`
+	// Masked display fields (full Email/AuthFile remain for copy & panel join).
+	EmailMasked    string `json:"email_masked,omitempty"`
+	AuthFileMasked string `json:"auth_file_masked,omitempty"`
+	// ShowReference is false when usage already exceeds the 2M baseline —
+	// UI should only show the dynamic ceiling then.
+	ShowReference bool `json:"show_reference"`
+	// ReferenceTokens is the baseline (default 2M), not an official cap.
+	ReferenceTokens  int64  `json:"reference_tokens"`
 	ReferenceTokensM string `json:"reference_tokens_m,omitempty"`
 	// PctOfReference can exceed 100 when real usage is above the baseline.
 	PctOfReference float64 `json:"pct_of_reference"`
@@ -186,20 +198,9 @@ func detectGlobalStatusPath() string {
 	if v := strings.TrimSpace(os.Getenv("CPA_ACCOUNT_STATUS")); v != "" {
 		return v
 	}
-	candidates := []string{
-		filepath.Join("plugins", "account-status.json"),
-		`E:\CPA\plugins\account-status.json`,
-	}
-	if cwd, err := os.Getwd(); err == nil {
-		candidates = append([]string{
-			filepath.Join(cwd, "plugins", "account-status.json"),
-			filepath.Clean(filepath.Join(cwd, "..", "plugins", "account-status.json")),
-		}, candidates...)
-	}
-	for _, c := range candidates {
-		if info, err := os.Stat(c); err == nil && !info.IsDir() {
-			return c
-		}
+	candidates := underRoots("plugins", "account-status.json")
+	if found := firstExistingFile(candidates...); found != "" {
+		return found
 	}
 	return filepath.Join("plugins", "account-status.json")
 }
@@ -324,26 +325,19 @@ func detectUsageDBPath() string {
 	if v := strings.TrimSpace(os.Getenv("GROK_PANEL_CPAMP_DB")); v != "" {
 		candidates = append(candidates, v)
 	}
-	candidates = append(candidates,
-		`E:\CPAMP\data\usage.sqlite`,
-		`C:\CPAMP\data\usage.sqlite`,
-	)
-	if cwd, err := os.Getwd(); err == nil {
+	// Common layouts next to CPA root or sibling CPAMP.
+	for _, root := range pathRoots() {
 		candidates = append(candidates,
-			filepath.Join(cwd, "CPAMP", "data", "usage.sqlite"),
-			filepath.Clean(filepath.Join(cwd, "..", "CPAMP", "data", "usage.sqlite")),
+			filepath.Join(root, "CPAMP", "data", "usage.sqlite"),
+			filepath.Join(filepath.Dir(root), "CPAMP", "data", "usage.sqlite"),
+			filepath.Join(root, "data", "usage.sqlite"),
 		)
 	}
-	for _, c := range candidates {
-		c = strings.TrimSpace(c)
-		if c == "" {
-			continue
-		}
-		if info, err := os.Stat(c); err == nil && !info.IsDir() {
-			return c
-		}
-	}
-	return ""
+	candidates = append(candidates,
+		filepath.Join("CPAMP", "data", "usage.sqlite"),
+		filepath.Join("data", "usage.sqlite"),
+	)
+	return firstExistingFile(candidates...)
 }
 
 func openUsageDB(path string) (*sql.DB, error) {
@@ -532,7 +526,7 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 		LimitTokens:  defaultReferenceTokens, // snapshot-level baseline only
 		DBPath:       dbPath,
 		Source:       sourceRolling,
-		Note:         "本地日志观测，非 xAI 官方余额。仅当 usage_events 出现额度错误码时才标记额度问题；2M 只是参考基线，实际用量按近 24h 如实记录。",
+		Note:         "日志观测，非 xAI 官方余额。仅当 usage_events 出现额度错误码时才标记额度问题；2M 为参考基线，超线后按真实用量动态抬升上限。",
 		Summary: quotaSummary{
 			Window:           "rolling_24h",
 			WindowLabel:      "近 24 小时滚动",
@@ -761,7 +755,7 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 		}
 
 		// Only log-proven quota exhaustion marks a problem (from usage_events /
-		// account-status join). Local rolling tokens alone never means exhausted.
+		// account-status join). Rolling tokens alone never means exhausted.
 		if cool {
 			acc.Health = "cooldown"
 			acc.Reason = c.reason
@@ -776,24 +770,30 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 			acc.Remaining = 0
 			acc.Pct = 100
 			acc.QuotaUsed = tokens
+			acc.ShowReference = tokens <= defaultReferenceTokens
 			// Suggest whenever logs prove quota exhaustion and the file is still enabled.
 			// Auto-disable (optional) still only writes live pool files.
 			if !s.disabled {
 				acc.SuggestDisable = true
 				acc.ActionHint = "日志含额度错误，建议停用"
+				acc.Remark = "近 24h 日志出现额度失败（如免费额度用尽/消费限额），建议停用该凭证；恢复时间见右侧。"
 			} else {
 				acc.ActionHint = "已停用"
+				acc.Remark = "凭证已停用；历史日志仍含额度失败记录。"
 			}
 		} else {
 			// Healthy: record real usage; grow display limit with usage so the
 			// bar never pretends "stopped at 2M".
-			acc.LimitMode = "dynamic"
 			acc.LimitTokens = dynamicLimit(tokens, defaultReferenceTokens)
 			if tokens > defaultReferenceTokens {
 				acc.OverReference = true
 				acc.LimitMode = "dynamic"
+				acc.ShowReference = false // hide 2M baseline once exceeded
+				acc.Remark = "近 24h 已超过 2M 参考线，日志无额度错误；可能仍可用，也可能上游已限流。请结合请求是否成功判断。"
+				acc.ActionHint = ""
 			} else {
 				acc.LimitMode = "reference"
+				acc.ShowReference = true
 			}
 			acc.Remaining = acc.LimitTokens - tokens
 			if acc.Remaining < 0 {
@@ -806,6 +806,27 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 		}
 		if defaultReferenceTokens > 0 {
 			acc.PctOfReference = float64(tokens) / float64(defaultReferenceTokens) * 100
+		}
+		// Unified status for filters (priority: disabled > quota_issue > high_usage > active).
+		switch {
+		case s.disabled:
+			acc.StatusKind = "disabled"
+			acc.StatusLabel = "已停用"
+			if acc.Remark == "" {
+				acc.Remark = "凭证在号池中为停用状态，请求侧通常不会再选用。"
+			}
+			if acc.ActionHint == "" {
+				acc.ActionHint = "已停用"
+			}
+		case cool:
+			acc.StatusKind = "quota_issue"
+			acc.StatusLabel = "额度问题"
+		case acc.OverReference:
+			acc.StatusKind = "high_usage"
+			acc.StatusLabel = "高用量"
+		default:
+			acc.StatusKind = "active"
+			acc.StatusLabel = "正常"
 		}
 		acc.QuotaLimit = acc.LimitTokens
 		acc.QuotaRemaining = acc.Remaining
@@ -906,18 +927,18 @@ func buildMetaLines(snap quotaSnapshot) []string {
 	}
 	lines := []string{
 		fmt.Sprintf("成员：现网 auth-dir（%s）", mem),
-		"用量：CPAMP usage_events · 近 24h",
+		"用量：CPAMP usage_events · 近 24 小时",
 		"时区：北京时间（UTC+8）",
 		fmt.Sprintf("统计：%s", snap.ComputedAtCN),
-		fmt.Sprintf("参考基线：%s/账号（非硬上限，随实际用量动态抬升）", formatTokensM(defaultReferenceTokens)),
+		fmt.Sprintf("参考基线：%s/账号；超过后只显示动态上限", formatTokensM(defaultReferenceTokens)),
 	}
 	if s.DroppedHistorical > 0 {
-		lines = append(lines, fmt.Sprintf("历史账号已过滤：%d（不在现网 auth-dir）", s.DroppedHistorical))
+		lines = append(lines, fmt.Sprintf("已过滤历史账号：%d（不在现网 auth-dir）", s.DroppedHistorical))
 	}
 	if s.AutoDisableEnabled {
 		lines = append(lines, "自动停用：开（仅日志额度证据）")
 	} else {
-		lines = append(lines, "自动停用：关（仅建议，不写 disabled）")
+		lines = append(lines, "自动停用：关（只建议，不写 disabled）")
 	}
 	if s.AutoDisabledNow > 0 {
 		lines = append(lines, fmt.Sprintf("本轮自动停用：%d", s.AutoDisabledNow))
@@ -925,7 +946,7 @@ func buildMetaLines(snap quotaSnapshot) []string {
 	if snap.Error != "" {
 		lines = append(lines, "错误："+snap.Error)
 	}
-	lines = append(lines, "说明：本地日志观测，非 xAI 官方余额；额度问题只看失败日志，不因用量≥2M 误标。")
+	lines = append(lines, "说明：非 xAI 官方余额；额度问题只看失败日志；邮箱默认脱敏，可复制全文。")
 	return lines
 }
 
