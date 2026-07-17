@@ -2,15 +2,15 @@
 
 > **中文** | [English](README.en.md)
 
-[![Release](https://img.shields.io/badge/release-v0.1.8-blue)](https://github.com/gzy3894-png/grok-quota/releases/tag/v0.1.8)
+[![Release](https://img.shields.io/badge/release-v0.1.9-blue)](https://github.com/gzy3894-png/grok-quota/releases/tag/v0.1.9)
 [![CPA Plugin](https://img.shields.io/badge/CLIProxyAPI-plugin-111827)](https://github.com/router-for-me/CLIProxyAPI)
 [![Platform](https://img.shields.io/badge/platform-windows%20amd64-0f766e)](./README.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![LINUX DO](https://img.shields.io/badge/LINUX%20DO-社区认可-0066cc)](https://linux.do/)
 
-Grok Quota 是一个给 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI) 用的本地插件。它做的事情很简单：**帮你看清楚当前号池里，每个 xAI / Grok 账号在最近 24 小时大概用了多少 token**，并把结果整理成控制台和 JSON，方便面板、脚本或人工巡检时对照。
+Grok Quota 是一个给 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI) 用的本地插件。它做的事情很简单：**从 CPAMP 请求日志里，整理每个 xAI / Grok 账号近 24 小时的真实用量**，只在日志出现额度错误码时标记问题，并可选择是否自动停用。
 
-一句话：它是「查额度」的观测插件，不是「踢号」或「封禁」工具。
+一句话：它是「过滤额度日志」的观测插件；默认不踢号。2M 只是参考基线，不是硬上限。
 
 ## 它解决什么问题
 
@@ -22,7 +22,9 @@ Grok Quota 是一个给 [CLIProxyAPI（CPA）](https://github.com/router-for-me/
 
 Grok Quota 专门读本地 [CPAMP](https://github.com/router-for-me/CLIProxyAPI) / 用量库里的 `usage_events`，按 **滚动 24 小时**汇总成功请求的 token，并可选地合并全局账号状态总线（如 `account-status.json`）里的冷却信息，给面板做只读展示。
 
-本地默认把 `2,000,000 tokens / 24h` 当作观测参考线（与上游 free 档常见滚动窗口对齐）。**这是本地观察策略，不是官方余额接口。**
+默认把 `2,000,000 tokens / 24h` 当作**参考基线**。若账号真实用量到了 3M，动态上限就是 3M，进度条与统计都会如实显示——**绝不会因为到了 2M 就当成「本地已满」或停止记录。**
+
+**额度问题只认日志**：`free-usage-exhausted` / `spending-limit` 等错误码。可选开关「自动停用额度问题账号」（默认关）。
 
 ## 社区
 
@@ -52,7 +54,7 @@ https://github.com/gzy3894-png/grok-quota/discussions
 | --- | --- |
 | 查滚动 24h 用量 | **是** |
 | 写控制台 / JSON / `grok-quota-state.json` | **是**（仅本文件） |
-| 写 auth `disabled=true` | **否** |
+| 写 auth `disabled=true` | **默认否**；可选自动停用（仅日志额度证据） |
 | 替代 xAI 官方额度 API | **否** |
 | 自动封禁 401/403 | **否**（请用其它 REALTIME 插件） |
 
@@ -137,8 +139,10 @@ plugins:
 | `tokens_24h` / `quota_used` | 近 24h 成功请求的 `total_tokens` 合计 |
 | `limit_tokens` / `quota_limit` | 本地观测上限，默认 `2_000_000` |
 | `quota_remaining` | 本地窗口剩余量（观测值） |
-| `health=cooldown` | 存在额度相关硬信号（如 free-usage-exhausted / spending-limit）并仍在冷却窗口 |
-| `health=soft_exhausted` | 本地滚动量已达参考线，但**无**硬失败；仅展示，不写 disabled |
+| `health=cooldown` | 日志出现额度错误码且仍在恢复窗口 → 标记「额度问题」，建议停用 |
+| `over_reference` | 真实用量超过参考基线，**不等于**额度耗尽 |
+| `suggest_disable` | 有日志额度证据且账号仍启用 |
+| `limit_tokens` | 动态上限 = max(参考基线, 真实用量) |
 | `source` | `cpamp_usage_events_rolling_24h` |
 
 Panel 侧应优先使用 `quota_*` / `cooldown_until` 等别名字段，**不要**把历史累计 token 当成 2M/24h。
@@ -159,8 +163,8 @@ Panel 侧应优先使用 `quota_*` / `cooldown_until` 等别名字段，**不要
 | 项目 | 值 |
 | --- | --- |
 | 插件名 | `grok-quota` |
-| 版本 | `0.1.8` |
-| 角色 | QUERY（只读观测） |
+| 版本 | `0.1.9` |
+| 角色 | QUERY（默认只读；可选自动停用） |
 | 主要平台 | Windows amd64（`.dll`） |
 | 许可证 | MIT |
 

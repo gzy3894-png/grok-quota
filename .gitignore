@@ -26,3 +26,6 @@ auths/
 **/usage.sqlite
 **/account-status.json
 **/grok-quota-state.json
+
+release-staging/
+

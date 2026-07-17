@@ -2,7 +2,7 @@
 
 > [中文](README.md) | **English**
 
-[![Release](https://img.shields.io/badge/release-v0.1.8-blue)](https://github.com/gzy3894-png/grok-quota/releases/tag/v0.1.8)
+[![Release](https://img.shields.io/badge/release-v0.1.9-blue)](https://github.com/gzy3894-png/grok-quota/releases/tag/v0.1.9)
 [![CPA Plugin](https://img.shields.io/badge/CLIProxyAPI-plugin-111827)](https://github.com/router-for-me/CLIProxyAPI)
 [![Platform](https://img.shields.io/badge/platform-windows%20amd64-0f766e)](./README.en.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
@@ -152,8 +152,8 @@ Panel consumers should prefer `quota_*` / `cooldown_until` aliases and **must no
 | Item | Value |
 | --- | --- |
 | Plugin name | `grok-quota` |
-| Version | `0.1.8` |
-| Role | QUERY (read-only observation) |
+| Version | `0.1.9` |
+| Role | QUERY (observe by default; optional auto-disable) |
 | Primary platform | Windows amd64 (`.dll`) |
 | License | MIT |
 
