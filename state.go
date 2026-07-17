@@ -14,8 +14,8 @@ var (
 	stateMu       sync.RWMutex
 	cachedSnap    quotaSnapshot
 	cachedAt      time.Time
-	cacheTTL      = 15 * time.Second
-	refreshEvery  = 20 * time.Second
+	cacheTTL      = 5 * time.Second
+	refreshEvery  = 10 * time.Second
 	stateFilePath = defaultStatePath()
 	stopRefresh   chan struct{}
 	refreshOnce   sync.Once

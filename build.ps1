@@ -28,12 +28,12 @@ try {
     $dist = Join-Path $repoRoot 'dist'
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
     $artifact = Join-Path $dist 'grok-quota.dll'
-    $versioned = Join-Path $dist 'grok-quota-v0.1.8.dll'
+    $versioned = Join-Path $dist 'grok-quota-v0.1.9.dll'
     & $go.Source build -buildvcs=false -buildmode=c-shared -trimpath -ldflags='-s -w' -o $artifact .
     if ($LASTEXITCODE -ne 0) { throw "go build failed with exit $LASTEXITCODE" }
     Copy-Item -LiteralPath $artifact -Destination $versioned -Force
 
-    foreach ($headerName in @('grok-quota.h', 'grok-quota-v0.1.8.h')) {
+    foreach ($headerName in @('grok-quota.h', 'grok-quota-v0.1.9.h')) {
         $header = Join-Path $dist $headerName
         if (Test-Path -LiteralPath $header) {
             Remove-Item -LiteralPath $header -Force

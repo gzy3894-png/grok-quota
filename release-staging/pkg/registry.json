@@ -4,9 +4,9 @@
     {
       "id": "grok-quota",
       "name": "Grok Quota",
-      "description": "Local rolling 24h Grok usage log observer for CLIProxyAPI (CPA). Dynamic limits from real 24h usage; marks quota issues only from logs; optional auto-disable.",
+      "description": "Local rolling 24h Grok free-tier usage observation for CLIProxyAPI (CPA). Reads CPAMP usage_events; display-only QUERY plugin — never writes auth disabled.",
       "author": "gzy3894-png",
-      "version": "0.1.9",
+      "version": "0.1.8",
       "repository": "https://github.com/gzy3894-png/grok-quota",
       "homepage": "https://github.com/gzy3894-png/grok-quota",
       "license": "MIT",

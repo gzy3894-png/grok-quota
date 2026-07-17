@@ -50,10 +50,11 @@ func healthLabelZH(health string) string {
 	switch strings.ToLower(strings.TrimSpace(health)) {
 	case "healthy":
 		return "正常"
-	case "cooldown":
-		return "冷却中"
+	case "cooldown", "quota_issue", "quota_exhausted":
+		return "额度问题"
 	case "soft_exhausted":
-		return "本地已满"
+		// Deprecated: local 2M alone is not exhaustion.
+		return "高用量(旧)"
 	case "unknown", "":
 		return "未知"
 	default:
@@ -102,7 +103,11 @@ func enrichAccountDisplay(a *accountQuota) {
 	a.Tokens24hM = formatTokensM(a.Tokens24h)
 	a.LimitTokensM = formatTokensM(a.LimitTokens)
 	a.RemainingM = formatTokensM(a.Remaining)
+	a.ReferenceTokensM = formatTokensM(a.ReferenceTokens)
 	a.FailureAtCN = formatTimeCN(a.FailureAt)
 	a.RecoverAtCN = formatTimeCN(a.RecoverAt)
 	a.LastUsageAtCN = formatTimeCN(a.LastUsageAt)
+	if a.ActionHint == "" && a.SuggestDisable {
+		a.ActionHint = "日志含额度错误，建议停用"
+	}
 }

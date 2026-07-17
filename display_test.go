@@ -15,11 +15,11 @@ func TestFormatTokensM(t *testing.T) {
 }
 
 func TestHealthAndReasonZH(t *testing.T) {
-	if healthLabelZH("cooldown") != "冷却中" {
-		t.Fatal("cooldown label")
+	if healthLabelZH("cooldown") != "额度问题" {
+		t.Fatalf("cooldown label=%s", healthLabelZH("cooldown"))
 	}
-	if healthLabelZH("soft_exhausted") != "本地已满" {
-		t.Fatal("soft label")
+	if healthLabelZH("healthy") != "正常" {
+		t.Fatal("healthy label")
 	}
 	if reasonLabelZH("subscription:free-usage-exhausted") != "免费额度用尽" {
 		t.Fatal("reason free")

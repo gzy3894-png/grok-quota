@@ -15,11 +15,28 @@ import (
 )
 
 const (
-	defaultLimitTokens int64 = 2_000_000
-	defaultWindow            = 24 * time.Hour
-	xaiProvider              = "xai"
-	sourceRolling            = "cpamp_usage_events_rolling_24h"
+	// defaultReferenceTokens is only a UI/reference baseline for free-tier
+	// observation. It is NOT a hard account cap and never truncates usage.
+	defaultReferenceTokens int64 = 2_000_000
+	defaultWindow                = 24 * time.Hour
+	xaiProvider                  = "xai"
+	sourceRolling                = "cpamp_usage_events_rolling_24h"
 )
+
+// dynamicLimit returns the display ceiling for an account:
+// max(reference, real 24h usage). Usage is never capped for recording.
+func dynamicLimit(tokens24h, reference int64) int64 {
+	if reference <= 0 {
+		reference = defaultReferenceTokens
+	}
+	if tokens24h < 0 {
+		tokens24h = 0
+	}
+	if tokens24h > reference {
+		return tokens24h
+	}
+	return reference
+}
 
 var (
 	quotaCodeRE = regexp.MustCompile(`(?i)(free-usage-exhausted|spending-limit|out of credits|personal-team-blocked:spending-limit|resource[_ ]?exhausted|insufficient.?credits|quota exceeded|quota_exceeded)`)
@@ -54,7 +71,24 @@ type accountQuota struct {
 	Source        string  `json:"source"`
 	LastUsageAt   string  `json:"last_usage_at,omitempty"`
 	LastUsageAtCN string  `json:"last_usage_at_cn,omitempty"`
-	SoftExhausted bool    `json:"soft_exhausted"`
+	// SoftExhausted is deprecated: local rolling usage alone never marks full.
+	// Kept for API compatibility; always false for new snapshots.
+	SoftExhausted bool `json:"soft_exhausted"`
+	// OverReference means tokens_24h exceeds the local reference baseline (default 2M)
+	// without implying official exhaustion.
+	OverReference bool `json:"over_reference"`
+	// SuggestDisable is true when usage_events prove a quota problem and the
+	// account is still enabled in the live pool.
+	SuggestDisable bool   `json:"suggest_disable"`
+	ActionHint     string `json:"action_hint,omitempty"`
+	// ReferenceTokens is the local baseline (default 2M), not an official cap.
+	ReferenceTokens int64   `json:"reference_tokens"`
+	ReferenceTokensM string `json:"reference_tokens_m,omitempty"`
+	// PctOfReference can exceed 100 when real usage is above the baseline.
+	PctOfReference float64 `json:"pct_of_reference"`
+	// LimitMode: reference | dynamic | exhausted
+	LimitMode string `json:"limit_mode,omitempty"`
+
 	SchedulerOwner   string `json:"scheduler_owner,omitempty"`
 	GlobalStatusKind string `json:"global_status_kind,omitempty"`
 
@@ -64,7 +98,7 @@ type accountQuota struct {
 	PoolStatus    string `json:"pool_status,omitempty"` // active|disabled|missing
 	MembershipKey string `json:"membership_key,omitempty"`
 
-	// Panel-facing aliases (Codex contract). Display consumers should prefer these.
+	// Panel-facing aliases. quota_used is always real rolling usage (uncapped).
 	QuotaLimit       int64  `json:"quota_limit"`
 	QuotaUsed        int64  `json:"quota_used"`
 	QuotaRemaining   int64  `json:"quota_remaining"`
@@ -98,20 +132,31 @@ type quotaSummary struct {
 	AccountCount            int    `json:"account_count"`
 	ActiveAccounts          int    `json:"active_accounts"`
 	DisabledAccounts        int    `json:"disabled_accounts"`
-	CooldownAccounts        int    `json:"cooldown_accounts"`
+	CooldownAccounts        int    `json:"cooldown_accounts"` // log-proven quota issues still in recover window
+	QuotaIssueAccounts      int    `json:"quota_issue_accounts"`
+	SuggestDisableAccounts  int    `json:"suggest_disable_accounts"`
+	HighUsageAccounts       int    `json:"high_usage_accounts"` // over reference, no log issue
+	// SoftExhaustedAccounts deprecated; always 0 (local 2M alone is not exhaustion).
 	SoftExhaustedAccounts   int    `json:"soft_exhausted_accounts"`
 	UsedTokens              int64  `json:"used_tokens"`
 	UsedTokensM             string `json:"used_tokens_m"`
+	// MaximumTokens is sum of per-account dynamic display ceilings (not N*2M hard cap).
 	MaximumTokens           int64  `json:"maximum_tokens"`
 	MaximumTokensM          string `json:"maximum_tokens_m"`
+	// CurrentAvailableTokens is sum of display remaining vs dynamic ceilings.
 	CurrentAvailableTokens  int64  `json:"current_available_tokens"`
 	CurrentAvailableTokensM string `json:"current_available_tokens_m"`
+	ReferenceTokens         int64  `json:"reference_tokens"`
+	ReferenceTokensM        string `json:"reference_tokens_m,omitempty"`
 	Window                  string `json:"window"`
 	WindowLabel             string `json:"window_label"`
 	Source                  string `json:"source"`
 	AuthDir                 string `json:"auth_dir,omitempty"`
 	MembershipSource        string `json:"membership_source,omitempty"`
 	DroppedHistorical       int    `json:"dropped_historical_accounts,omitempty"`
+	AutoDisableEnabled      bool   `json:"auto_disable_enabled"`
+	AutoDisabledNow         int    `json:"auto_disabled_now,omitempty"`
+	MetaLines               []string `json:"meta_lines,omitempty"`
 }
 
 type usageAgg struct {
@@ -475,6 +520,7 @@ func deriveEmail(accountSnapshot, authFile string) string {
 func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 	now = now.UTC()
 	authDir := detectAuthDir()
+	cfg := loadSettings()
 	snap := quotaSnapshot{
 		Plugin:       pluginName,
 		Version:      pluginVersion,
@@ -483,16 +529,19 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 		Timezone:     "Asia/Shanghai (UTC+8)",
 		AsOfMS:       now.UnixMilli(),
 		WindowHours:  int(defaultWindow / time.Hour),
-		LimitTokens:  defaultLimitTokens,
+		LimitTokens:  defaultReferenceTokens, // snapshot-level baseline only
 		DBPath:       dbPath,
 		Source:       sourceRolling,
-		Note:         "本地观测额度，非 xAI 官方余额。账号列表以 CPA auth-dir 现网文件为准（已删除账号不会出现）；用量来自 usage_events 近24h；冷却 join account-status + 额度失败事件。",
+		Note:         "本地日志观测，非 xAI 官方余额。仅当 usage_events 出现额度错误码时才标记额度问题；2M 只是参考基线，实际用量按近 24h 如实记录。",
 		Summary: quotaSummary{
 			Window:           "rolling_24h",
-			WindowLabel:      "滚动 24 小时",
+			WindowLabel:      "近 24 小时滚动",
 			Source:           sourceRolling,
 			AuthDir:          authDir,
 			MembershipSource: "cpa_auth_dir",
+			ReferenceTokens:  defaultReferenceTokens,
+			ReferenceTokensM: formatTokensM(defaultReferenceTokens),
+			AutoDisableEnabled: cfg.AutoDisableQuotaExhausted,
 		},
 		Accounts: []accountQuota{},
 	}
@@ -680,20 +729,25 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 			displayIndex = c.authIndex
 		}
 
+		tokens := u.tokens24h
+		if tokens < 0 {
+			tokens = 0
+		}
 		acc := accountQuota{
-			AuthIndex:     displayIndex,
-			Email:         email,
-			AuthFile:      authFile,
-			Tokens24h:     u.tokens24h,
-			Success24h:    u.success24h,
-			Failed24h:     u.failed24h,
-			LimitTokens:   defaultLimitTokens,
-			Window:        "rolling_24h",
-			Source:        sourceRolling,
-			Health:        "healthy",
-			InPool:        s.inPool,
-			AuthDisabled:  s.disabled,
-			MembershipKey: s.key,
+			AuthIndex:       displayIndex,
+			Email:           email,
+			AuthFile:        authFile,
+			Tokens24h:       tokens,
+			Success24h:      u.success24h,
+			Failed24h:       u.failed24h,
+			ReferenceTokens: defaultReferenceTokens,
+			Window:          "rolling_24h",
+			Source:          sourceRolling,
+			Health:          "healthy",
+			SoftExhausted:   false, // never mark "full" from local 2M alone
+			InPool:          s.inPool,
+			AuthDisabled:    s.disabled,
+			MembershipKey:   s.key,
 		}
 		if s.disabled {
 			acc.PoolStatus = "disabled"
@@ -705,6 +759,9 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 		if !u.lastUsage.IsZero() {
 			acc.LastUsageAt = u.lastUsage.Format(time.RFC3339Nano)
 		}
+
+		// Only log-proven quota exhaustion marks a problem (from usage_events /
+		// account-status join). Local rolling tokens alone never means exhausted.
 		if cool {
 			acc.Health = "cooldown"
 			acc.Reason = c.reason
@@ -713,30 +770,44 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 			acc.StatusCode = c.statusCode
 			acc.SchedulerOwner = "quota-enforcer-v1"
 			acc.GlobalStatusKind = "quota_cooldown"
-		} else if acc.Tokens24h >= defaultLimitTokens {
-			acc.SoftExhausted = true
-			acc.Health = "soft_exhausted"
-		}
-		if acc.Tokens24h < 0 {
-			acc.Tokens24h = 0
-		}
-		usedForBar := acc.Tokens24h
-		if usedForBar > defaultLimitTokens {
-			usedForBar = defaultLimitTokens
-		}
-		if acc.Health == "cooldown" {
+			acc.LimitMode = "exhausted"
+			// Display ceiling follows real usage; never invent a fake 2M used.
+			acc.LimitTokens = dynamicLimit(tokens, defaultReferenceTokens)
 			acc.Remaining = 0
 			acc.Pct = 100
-			acc.QuotaUsed = defaultLimitTokens
+			acc.QuotaUsed = tokens
+			// Suggest whenever logs prove quota exhaustion and the file is still enabled.
+			// Auto-disable (optional) still only writes live pool files.
+			if !s.disabled {
+				acc.SuggestDisable = true
+				acc.ActionHint = "日志含额度错误，建议停用"
+			} else {
+				acc.ActionHint = "已停用"
+			}
 		} else {
-			acc.Remaining = defaultLimitTokens - usedForBar
+			// Healthy: record real usage; grow display limit with usage so the
+			// bar never pretends "stopped at 2M".
+			acc.LimitMode = "dynamic"
+			acc.LimitTokens = dynamicLimit(tokens, defaultReferenceTokens)
+			if tokens > defaultReferenceTokens {
+				acc.OverReference = true
+				acc.LimitMode = "dynamic"
+			} else {
+				acc.LimitMode = "reference"
+			}
+			acc.Remaining = acc.LimitTokens - tokens
 			if acc.Remaining < 0 {
 				acc.Remaining = 0
 			}
-			acc.Pct = float64(usedForBar) / float64(defaultLimitTokens) * 100
-			acc.QuotaUsed = acc.Tokens24h
+			if acc.LimitTokens > 0 {
+				acc.Pct = float64(tokens) / float64(acc.LimitTokens) * 100
+			}
+			acc.QuotaUsed = tokens
 		}
-		acc.QuotaLimit = defaultLimitTokens
+		if defaultReferenceTokens > 0 {
+			acc.PctOfReference = float64(tokens) / float64(defaultReferenceTokens) * 100
+		}
+		acc.QuotaLimit = acc.LimitTokens
 		acc.QuotaRemaining = acc.Remaining
 		acc.QuotaHealth = acc.Health
 		acc.QuotaFailureAt = acc.FailureAt
@@ -752,28 +823,29 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 		return accounts[i].Tokens24h > accounts[j].Tokens24h
 	})
 
-	var usedSum int64
+	var usedSum, limitSum, remainSum int64
 	for _, a := range accounts {
-		used := a.QuotaUsed
-		if a.Health != "cooldown" {
-			used = a.Tokens24h
-			if used > defaultLimitTokens {
-				used = defaultLimitTokens
-			}
-		}
+		used := a.Tokens24h
 		if used < 0 {
 			used = 0
 		}
-		// Capacity only counts live pool accounts (deleted ones are gone).
+		// Real rolling usage only — never clamp to 2M.
 		if a.InPool {
 			usedSum += used
+			limitSum += a.LimitTokens
+			remainSum += a.Remaining
 		}
 		if a.Health == "cooldown" {
 			snap.Summary.CooldownAccounts++
+			snap.Summary.QuotaIssueAccounts++
 		}
-		if a.SoftExhausted {
-			snap.Summary.SoftExhaustedAccounts++
+		if a.SuggestDisable {
+			snap.Summary.SuggestDisableAccounts++
 		}
+		if a.OverReference && a.Health != "cooldown" {
+			snap.Summary.HighUsageAccounts++
+		}
+		// soft_exhausted_accounts intentionally stays 0
 		if a.AuthDisabled {
 			snap.Summary.DisabledAccounts++
 		} else if a.InPool {
@@ -793,14 +865,9 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 	snap.ByAuthIndex = byAuth
 	snap.Summary.AccountCount = n
 	snap.Summary.DroppedHistorical = dropped
-	// Pool capacity = live accounts only.
-	liveN := snap.Summary.ActiveAccounts + snap.Summary.DisabledAccounts
-	if liveN == 0 {
-		liveN = n
-	}
-	snap.Summary.MaximumTokens = int64(liveN) * defaultLimitTokens
+	snap.Summary.MaximumTokens = limitSum
 	snap.Summary.UsedTokens = usedSum
-	snap.Summary.CurrentAvailableTokens = snap.Summary.MaximumTokens - usedSum
+	snap.Summary.CurrentAvailableTokens = remainSum
 	if snap.Summary.CurrentAvailableTokens < 0 {
 		snap.Summary.CurrentAvailableTokens = 0
 	}
@@ -808,10 +875,58 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 	snap.Summary.MaximumTokensM = formatTokensM(snap.Summary.MaximumTokens)
 	snap.Summary.CurrentAvailableTokensM = formatTokensM(snap.Summary.CurrentAvailableTokens)
 	if snap.Summary.WindowLabel == "" {
-		snap.Summary.WindowLabel = "滚动 24 小时"
+		snap.Summary.WindowLabel = "近 24 小时滚动"
 	}
+	snap.Summary.MetaLines = buildMetaLines(snap)
 	snap.SchedulerSync = loadSchedulerSync()
+
+	// Optional auto-disable for log-proven quota issues only.
+	_ = applyAutoDisableQuotaIssues(&snap)
+	// Rebuild by_auth_index after possible disable mutations.
+	if snap.Summary.AutoDisabledNow > 0 {
+		byAuth = make(map[string]accountQuota, len(snap.Accounts))
+		for i := range snap.Accounts {
+			enrichAccountDisplay(&snap.Accounts[i])
+			byAuth[snap.Accounts[i].AuthIndex] = snap.Accounts[i]
+			if snap.Accounts[i].MembershipKey != "" && snap.Accounts[i].MembershipKey != snap.Accounts[i].AuthIndex {
+				byAuth[snap.Accounts[i].MembershipKey] = snap.Accounts[i]
+			}
+		}
+		snap.ByAuthIndex = byAuth
+		snap.Summary.MetaLines = buildMetaLines(snap)
+	}
 	return snap
+}
+
+func buildMetaLines(snap quotaSnapshot) []string {
+	s := snap.Summary
+	mem := s.MembershipSource
+	if mem == "" {
+		mem = "cpa_auth_dir"
+	}
+	lines := []string{
+		fmt.Sprintf("成员：现网 auth-dir（%s）", mem),
+		"用量：CPAMP usage_events · 近 24h",
+		"时区：北京时间（UTC+8）",
+		fmt.Sprintf("统计：%s", snap.ComputedAtCN),
+		fmt.Sprintf("参考基线：%s/账号（非硬上限，随实际用量动态抬升）", formatTokensM(defaultReferenceTokens)),
+	}
+	if s.DroppedHistorical > 0 {
+		lines = append(lines, fmt.Sprintf("历史账号已过滤：%d（不在现网 auth-dir）", s.DroppedHistorical))
+	}
+	if s.AutoDisableEnabled {
+		lines = append(lines, "自动停用：开（仅日志额度证据）")
+	} else {
+		lines = append(lines, "自动停用：关（仅建议，不写 disabled）")
+	}
+	if s.AutoDisabledNow > 0 {
+		lines = append(lines, fmt.Sprintf("本轮自动停用：%d", s.AutoDisabledNow))
+	}
+	if snap.Error != "" {
+		lines = append(lines, "错误："+snap.Error)
+	}
+	lines = append(lines, "说明：本地日志观测，非 xAI 官方余额；额度问题只看失败日志，不因用量≥2M 误标。")
+	return lines
 }
 
 func loadSchedulerSync() map[string]any {
