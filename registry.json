@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "grok-quota",
+      "name": "Grok Quota",
+      "description": "Local rolling 24h Grok free-tier usage observation for CLIProxyAPI (CPA). Reads CPAMP usage_events; display-only QUERY plugin — never writes auth disabled.",
+      "author": "gzy3894-png",
+      "version": "0.1.8",
+      "repository": "https://github.com/gzy3894-png/grok-quota",
+      "homepage": "https://github.com/gzy3894-png/grok-quota",
+      "license": "MIT",
+      "tags": ["Management", "Grok", "Quota", "Stats"]
+    }
+  ]
+}
