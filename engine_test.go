@@ -35,12 +35,46 @@ func TestIsQuotaExhaustionFailure(t *testing.T) {
 	}
 }
 
-func TestDynamicLimit(t *testing.T) {
-	if got := dynamicLimit(500_000, 2_000_000); got != 2_000_000 {
-		t.Fatalf("under reference: %d", got)
+func TestParseOfficialActualLimit(t *testing.T) {
+	blob := `{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 2117440/1000000. Upgrade"}`
+	actual, limit, ok := parseOfficialActualLimit(blob)
+	if !ok || actual != 2_117_440 || limit != 1_000_000 {
+		t.Fatalf("got ok=%v actual=%d limit=%d", ok, actual, limit)
 	}
-	if got := dynamicLimit(3_000_000, 2_000_000); got != 3_000_000 {
-		t.Fatalf("over reference: %d", got)
+	if _, _, ok := parseOfficialActualLimit("no limit here"); ok {
+		t.Fatal("expected parse fail")
+	}
+}
+
+func TestAccountCeiling(t *testing.T) {
+	// No exhaust observation means the ceiling is genuinely unknown.
+	lim, mode, src, over := accountCeiling(3_100_000, observedOfficialLimit{}, false)
+	if lim != 0 || mode != "unknown" || src != "none_no_free_usage_exhaust_log" || !over {
+		t.Fatalf("no-obs: lim=%d mode=%s src=%s over=%v", lim, mode, src, over)
+	}
+	// The dynamic ceiling is the actual used amount when upstream reported exhaustion.
+	lim, mode, src, over = accountCeiling(400_000, observedOfficialLimit{Limit: 1_000_000, Actual: 1_200_000}, true)
+	if lim != 1_200_000 || mode != "observed" || src != "cpamp_free_usage_exhausted_actual_at_exhaust" || over {
+		t.Fatalf("obs-actual: lim=%d mode=%s src=%s over=%v", lim, mode, src, over)
+	}
+}
+
+func TestUpsertObservedLimitKeepsNewestExhaustionActual(t *testing.T) {
+	observed := map[string]observedOfficialLimit{}
+	older := observedOfficialLimit{
+		Limit:  2_000_000,
+		Actual: 2_100_000,
+		At:     time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC),
+	}
+	newer := observedOfficialLimit{
+		Limit:  1_000_000,
+		Actual: 1_200_000,
+		At:     time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC),
+	}
+	upsertObservedLimit(observed, "a1", older)
+	upsertObservedLimit(observed, "a1", newer)
+	if got := observed["a1"]; got.Actual != newer.Actual || got.Limit != newer.Limit {
+		t.Fatalf("latest exhaustion must replace prior ceiling, got actual/limit=%d/%d", got.Actual, got.Limit)
 	}
 }
 
@@ -110,16 +144,22 @@ VALUES (5,?, 'c3','xai','xai-c@x.com.json','c@x.com', 3100000, 0, 0, '', '', 0, 
 	if a1.Health != "healthy" {
 		t.Fatalf("a1 health=%s", a1.Health)
 	}
-	if a1.QuotaUsed != 500000 || a1.LimitTokens != 2_000_000 {
-		t.Fatalf("a1 used/limit = %d/%d", a1.QuotaUsed, a1.LimitTokens)
+	if a1.QuotaUsed != 500000 || a1.LimitTokens != nil {
+		t.Fatalf("a1 used/limit = %d/%v", a1.QuotaUsed, a1.LimitTokens)
+	}
+	if a1.LimitMode != "unknown" || a1.LimitSource != "none_no_free_usage_exhaust_log" {
+		t.Fatalf("a1 should have unknown ceiling, mode=%s src=%s", a1.LimitMode, a1.LimitSource)
+	}
+	if a1.Remaining != nil {
+		t.Fatalf("a1 remaining must be unknown, got %v", a1.Remaining)
 	}
 
 	b2 := by["b2"]
 	if b2.Health != "cooldown" {
 		t.Fatalf("b2 health=%s want cooldown", b2.Health)
 	}
-	if b2.Remaining != 0 {
-		t.Fatalf("b2 remaining=%d", b2.Remaining)
+	if b2.Remaining != nil || b2.LimitTokens != nil {
+		t.Fatalf("b2 must keep an unknown ceiling/remaining, got limit=%v remaining=%v", b2.LimitTokens, b2.Remaining)
 	}
 	// Real usage stays 0; do NOT invent 2M used.
 	if b2.QuotaUsed != 0 || b2.Tokens24h != 0 {
@@ -139,14 +179,15 @@ VALUES (5,?, 'c3','xai','xai-c@x.com.json','c@x.com', 3100000, 0, 0, '', '', 0, 
 	if c3.Tokens24h != 3_100_000 || c3.QuotaUsed != 3_100_000 {
 		t.Fatalf("c3 must record full 3.1M, got tokens=%d used=%d", c3.Tokens24h, c3.QuotaUsed)
 	}
-	if c3.LimitTokens != 3_100_000 {
-		t.Fatalf("c3 dynamic limit should be 3.1M, got %d", c3.LimitTokens)
+	// CRITICAL: without free-usage actual/limit, the ceiling is unknown.
+	if c3.LimitTokens != nil || c3.LimitMode != "unknown" {
+		t.Fatalf("c3 must have unknown ceiling, got limit=%v mode=%s", c3.LimitTokens, c3.LimitMode)
+	}
+	if c3.Remaining != nil {
+		t.Fatalf("c3 remaining must be unknown, got %v", c3.Remaining)
 	}
 	if !c3.OverReference {
 		t.Fatalf("c3 should be over reference")
-	}
-	if c3.ShowReference {
-		t.Fatalf("c3 should hide 2M reference once over")
 	}
 	if c3.StatusKind != "high_usage" {
 		t.Fatalf("c3 status_kind=%s want high_usage", c3.StatusKind)
@@ -293,6 +334,110 @@ VALUES (1,?, 'bad1','xai',?, 'bad@x.com', 100, 1, 429, 'subscription:free-usage-
 	}
 	if doc["disabled"] != true {
 		t.Fatalf("auth file not disabled: %#v", doc["disabled"])
+	}
+}
+
+func TestObservedOfficialLimitFromFreeUsageLog(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "usage.sqlite")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	_, err = db.Exec(`
+CREATE TABLE usage_events (
+  id INTEGER PRIMARY KEY,
+  timestamp_ms INTEGER,
+  auth_index TEXT,
+  auth_provider_snapshot TEXT,
+  auth_file_snapshot TEXT,
+  account_snapshot TEXT,
+  total_tokens INTEGER,
+  failed INTEGER,
+  fail_status_code INTEGER,
+  fail_summary TEXT,
+  fail_body TEXT,
+  header_quota_recover_at_ms INTEGER,
+  header_error_kind TEXT,
+  header_error_code TEXT
+);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	// Past free-usage exhaust establishes the next cycle's dynamic ceiling.
+	body := `{"code":"subscription:free-usage-exhausted","error":"tokens (actual/limit): 1000500/1000000"}`
+	mustExec(t, db, `INSERT INTO usage_events(id,timestamp_ms,auth_index,auth_provider_snapshot,auth_file_snapshot,account_snapshot,total_tokens,failed,fail_status_code,fail_summary,fail_body,header_quota_recover_at_ms,header_error_kind,header_error_code)
+VALUES (1,?, 'd4','xai','xai-d@x.com.json','d@x.com', 0, 1, 429, ?, ?, 0, '', '')`,
+		now.Add(-30*time.Hour).UnixMilli(), body, body)
+	// Current rolling usage under the observed 1M ceiling.
+	mustExec(t, db, `INSERT INTO usage_events(id,timestamp_ms,auth_index,auth_provider_snapshot,auth_file_snapshot,account_snapshot,total_tokens,failed,fail_status_code,fail_summary,fail_body,header_quota_recover_at_ms,header_error_kind,header_error_code)
+VALUES (2,?, 'd4','xai','xai-d@x.com.json','d@x.com', 400000, 0, 0, '', '', 0, '', '')`,
+		now.Add(-1*time.Hour).UnixMilli())
+	// Another account never exhausted — stays reference 2M.
+	mustExec(t, db, `INSERT INTO usage_events(id,timestamp_ms,auth_index,auth_provider_snapshot,auth_file_snapshot,account_snapshot,total_tokens,failed,fail_status_code,fail_summary,fail_body,header_quota_recover_at_ms,header_error_kind,header_error_code)
+VALUES (3,?, 'e5','xai','xai-e@x.com.json','e@x.com', 100000, 0, 0, '', '', 0, '', '')`,
+		now.Add(-1*time.Hour).UnixMilli())
+	// Historical usage stays separate from the rolling 24h numerator.
+	mustExec(t, db, `INSERT INTO usage_events(id,timestamp_ms,auth_index,auth_provider_snapshot,auth_file_snapshot,account_snapshot,total_tokens,failed,fail_status_code,fail_summary,fail_body,header_quota_recover_at_ms,header_error_kind,header_error_code)
+VALUES (4,?, 'd4','xai','xai-d@x.com.json','d@x.com', 800000, 0, 0, '', '', 0, '', '')`,
+		now.Add(-30*time.Hour).UnixMilli())
+	// A cooling account must keep its real rolling ratio, rather than a frozen 100%.
+	coolBody := `{"code":"subscription:free-usage-exhausted","error":"tokens (actual/limit): 1000000/1000000"}`
+	mustExec(t, db, `INSERT INTO usage_events(id,timestamp_ms,auth_index,auth_provider_snapshot,auth_file_snapshot,account_snapshot,total_tokens,failed,fail_status_code,fail_summary,fail_body,header_quota_recover_at_ms,header_error_kind,header_error_code)
+VALUES (5,?, 'f6','xai','xai-f@x.com.json','f@x.com', 1500000, 0, 0, '', '', 0, '', '')`,
+		now.Add(-45*time.Minute).UnixMilli())
+	mustExec(t, db, `INSERT INTO usage_events(id,timestamp_ms,auth_index,auth_provider_snapshot,auth_file_snapshot,account_snapshot,total_tokens,failed,fail_status_code,fail_summary,fail_body,header_quota_recover_at_ms,header_error_kind,header_error_code)
+VALUES (6,?, 'f6','xai','xai-f@x.com.json','f@x.com', 0, 1, 429, ?, ?, ?, '', '')`,
+		now.Add(-15*time.Minute).UnixMilli(), coolBody, coolBody, now.Add(time.Hour).UnixMilli())
+
+	t.Setenv("GROK_QUOTA_GLOBAL_STATUS", "none")
+	t.Setenv("GROK_QUOTA_AUTH_DIR", "none")
+	t.Setenv("GROK_QUOTA_AUTO_DISABLE", "false")
+	t.Setenv("GROK_QUOTA_SETTINGS_PATH", filepath.Join(dir, "settings.json"))
+	settingsLoaded = false
+
+	snap := buildSnapshot(dbPath, now)
+	if snap.Error != "" {
+		t.Fatalf("snapshot error: %s", snap.Error)
+	}
+	by := accountsByAuthIndex(snap)
+	d4 := by["d4"]
+	if d4.LimitTokens == nil || *d4.LimitTokens != 1_000_500 || d4.LimitMode != "observed" {
+		t.Fatalf("d4 limit/mode = %v/%s want 1.0005M/observed", d4.LimitTokens, d4.LimitMode)
+	}
+	if d4.Remaining == nil || *d4.Remaining != 600_500 {
+		t.Fatalf("d4 remaining=%v want 600500", d4.Remaining)
+	}
+	if d4.LimitSource != "cpamp_free_usage_exhausted_actual_at_exhaust" {
+		t.Fatalf("d4 limit_source=%s", d4.LimitSource)
+	}
+	if d4.LimitActualAtExhaust != 1_000_500 {
+		t.Fatalf("d4 actual_at_exhaust=%d", d4.LimitActualAtExhaust)
+	}
+	if d4.HistoricalTokens != 1_200_000 {
+		t.Fatalf("d4 historical_tokens=%d want 1200000", d4.HistoricalTokens)
+	}
+	if d4.ShowReference {
+		t.Fatalf("d4 should not show an unconfirmed reference once observed")
+	}
+	e5 := by["e5"]
+	if e5.LimitTokens != nil || e5.LimitMode != "unknown" {
+		t.Fatalf("e5 should have unknown ceiling, got %v/%s", e5.LimitTokens, e5.LimitMode)
+	}
+	if e5.HistoricalTokens != 100_000 {
+		t.Fatalf("e5 historical_tokens=%d", e5.HistoricalTokens)
+	}
+	f6 := by["f6"]
+	if f6.Health != "cooldown" || f6.LimitTokens == nil || *f6.LimitTokens != 1_000_000 {
+		t.Fatalf("f6 cooldown/limit=%s/%v", f6.Health, f6.LimitTokens)
+	}
+	if f6.Pct == nil || *f6.Pct != 150 {
+		t.Fatalf("f6 pct=%v want real rolling ratio 150", f6.Pct)
+	}
+	if f6.Remaining == nil || *f6.Remaining != 0 {
+		t.Fatalf("f6 remaining=%v want 0 while cooldown is active", f6.Remaining)
 	}
 }
 

@@ -8,7 +8,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
-VERSION="0.1.14"
+VERSION="0.1.16"
 export CGO_ENABLED=1
 
 TARGET="${1:-$(go env GOOS)/$(go env GOARCH)}"

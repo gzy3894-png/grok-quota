@@ -2,7 +2,7 @@
 
 > [中文](README.md) | **English**
 
-[![Release](https://img.shields.io/badge/release-v0.1.9-blue)](https://github.com/gzy3894-png/grok-quota/releases/tag/v0.1.9)
+[![Release](https://img.shields.io/badge/release-v0.1.16-blue)](https://github.com/gzy3894-png/grok-quota/releases/tag/v0.1.16)
 [![CPA Plugin](https://img.shields.io/badge/CLIProxyAPI-plugin-111827)](https://github.com/router-for-me/CLIProxyAPI)
 [![Platform](https://img.shields.io/badge/platform-windows%20amd64-0f766e)](./README.en.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
@@ -22,7 +22,7 @@ When you run many free-tier Grok accounts behind CPA, three things often collide
 
 Grok Quota reads local CPAMP `usage_events`, sums successful tokens over a rolling 24h window, optionally joins a global account-status bus for cooldown display, and writes a display snapshot for Grok Panel and other consumers.
 
-The default local reference line is `2,000,000 tokens / 24h` (aligned with common free-tier rolling hints). **This is local observation policy, not an official balance API.**
+The default local reference line is `2,000,000 tokens / 24h` (aligned with common free-tier rolling hints). **This is local observation policy, not an official balance API.** When a `free-usage-exhausted` log contains `tokens (actual/limit)`, the latest `actual` value becomes that account's dynamic display ceiling for its next recovery cycle; an account with no such observation remains unknown.
 
 ## Community
 
@@ -152,7 +152,7 @@ Panel consumers should prefer `quota_*` / `cooldown_until` aliases and **must no
 | Item | Value |
 | --- | --- |
 | Plugin name | `grok-quota` |
-| Version | `0.1.9` |
+| Version | `0.1.16` |
 | Role | QUERY (observe by default; optional auto-disable) |
 | Primary platform | Windows amd64 (`.dll`) |
 | License | MIT |

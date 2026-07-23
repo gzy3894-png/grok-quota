@@ -12,7 +12,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
 $go = Get-Command go -ErrorAction Stop
-$version = '0.1.14'
+$version = '0.1.16'
 
 function Get-NativeTarget {
     $goos = (& $go.Source env GOOS).Trim()

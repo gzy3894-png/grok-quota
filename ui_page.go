@@ -43,12 +43,12 @@ func statusPage() string {
   </style>
 </head>
 <body class="h-full text-sm md:text-base">
-  <div class="flex min-h-full w-full flex-col gap-3 p-3 sm:gap-4 sm:p-4 md:gap-4 md:p-6">
+  <div class="flex min-h-full min-w-0 w-full flex-col gap-3 p-3 sm:gap-4 sm:p-4 md:gap-4 md:p-6">
     <!-- hero: full width of host -->
     <header class="flex w-full flex-col gap-3 rounded-xl bg-gradient-to-br from-slate-900 via-brand-dark to-brand px-4 py-4 text-teal-50 shadow-card sm:flex-row sm:items-end sm:justify-between sm:px-5 sm:py-5">
       <div class="min-w-0">
         <h1 class="m-0 text-xl font-bold tracking-tight md:text-2xl">Grok 额度观测</h1>
-        <p class="mt-1.5 text-xs text-teal-200/95 md:text-sm">近 24 小时滚动用量 · v` + ver + ` · 北京时间 · 2M 参考基线（非官方余额）</p>
+        <p class="mt-1.5 text-xs text-teal-200/95 md:text-sm">近 24 小时滚动用量 · v` + ver + ` · 北京时间</p>
       </div>
       <span id="updPill" class="inline-flex shrink-0 items-center rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-xs text-teal-50 md:text-sm">更新中…</span>
     </header>
@@ -82,7 +82,7 @@ func statusPage() string {
     </section>
 
     <!-- main panel -->
-    <section class="flex w-full min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-line bg-white shadow-card">
+    <section class="flex min-h-0 min-w-0 w-full flex-1 flex-col overflow-hidden rounded-xl border border-line bg-white shadow-card">
       <div class="flex w-full flex-col gap-2 border-b border-line p-3 sm:flex-row sm:flex-wrap sm:items-center sm:gap-3 sm:p-4">
         <input id="q" type="search" placeholder="搜索邮箱或备注" class="h-11 w-full min-w-0 flex-1 rounded-lg border border-line-strong bg-white px-3 text-sm outline-none ring-brand/30 focus:ring-2 md:h-10 md:text-base sm:min-w-[12rem]">
         <select id="st" title="账号状态" class="h-11 w-full rounded-lg border border-line-strong bg-white px-3 text-sm md:h-10 md:w-auto md:text-base">
@@ -116,16 +116,17 @@ func statusPage() string {
 
       <p id="msg" class="min-h-[1.25rem] px-3 pb-2 text-xs text-ink-muted sm:px-4 md:text-sm"></p>
 
-      <div class="w-full flex-1 overflow-x-auto">
-        <table class="w-full min-w-[48rem] border-separate border-spacing-0 text-left">
+      <div class="w-full min-w-0 flex-1 overflow-x-auto">
+        <table class="w-full min-w-[60rem] border-separate border-spacing-0 text-left">
           <colgroup>
-            <col class="w-[16%]"><col class="w-[12%]"><col class="w-[14%]">
-            <col class="w-[10%]"><col class="w-[12%]"><col class="w-[28%]"><col class="w-[8%]">
+            <col class="w-[15%]"><col class="w-[17%]"><col class="w-[12%]"><col class="w-[11%]">
+            <col class="w-[10%]"><col class="w-[12%]"><col class="w-[17%]"><col class="w-[6%]">
           </colgroup>
           <thead>
             <tr class="bg-slate-50 text-xs font-bold text-ink-muted md:text-sm">
               <th class="sticky top-0 z-10 border-b border-line bg-slate-50 px-3 py-3 sm:px-4">邮箱</th>
-              <th class="sticky top-0 z-10 border-b border-line bg-slate-50 px-3 py-3 sm:px-4">用量</th>
+              <th class="sticky top-0 z-10 border-b border-line bg-slate-50 px-3 py-3 sm:px-4">24h 已用额度 / 动态额度上限</th>
+              <th class="sticky top-0 z-10 border-b border-line bg-slate-50 px-3 py-3 sm:px-4">历史已用额度</th>
               <th class="sticky top-0 z-10 border-b border-line bg-slate-50 px-3 py-3 sm:px-4">进度</th>
               <th class="sticky top-0 z-10 border-b border-line bg-slate-50 px-3 py-3 sm:px-4">状态</th>
               <th class="sticky top-0 z-10 border-b border-line bg-slate-50 px-3 py-3 sm:px-4">预计恢复</th>
@@ -229,18 +230,23 @@ function fallbackCopy(t,done){
   catch(e){ $('msg').textContent='复制失败'; $('msg').className='min-h-[1.25rem] px-3 pb-2 text-xs text-red-600 sm:px-4 md:text-sm'; }
   document.body.removeChild(ta);
 }
+function hasDynamicLimit(a){
+  return (a.limit_mode==='observed' || a.limit_mode==='exhausted') && Number(a.limit_tokens)>0;
+}
 function usageCell(a){
   const tokens=Number(a.tokens_24h||0);
-  const ref=Number(a.reference_tokens||2000000);
-  const lim=Number(a.limit_tokens||Math.max(ref,tokens)||ref||1);
   const used=a.tokens_24h_m || toM(tokens);
-  const limM=a.limit_tokens_m || toM(lim);
+  const limM=hasDynamicLimit(a) ? (a.limit_tokens_m || toM(Number(a.limit_tokens))) : '未知';
   return '<span class="whitespace-nowrap font-bold tabular-nums"><b>'+esc(used)+'</b><span class="mx-1 font-medium text-ink-muted">/</span>'+esc(limM)+'</span>';
 }
+function historicalCell(a){
+  const tokens=Number(a.historical_tokens||0);
+  return '<span class="whitespace-nowrap tabular-nums">'+esc(a.historical_tokens_m || toM(tokens))+'</span>';
+}
 function pctBar(a){
+  if(!hasDynamicLimit(a)) return '<span class="text-xs text-ink-muted">未知</span>';
   const tokens=Number(a.tokens_24h||0);
-  const ref=Number(a.reference_tokens||2000000);
-  const lim=Number(a.limit_tokens||Math.max(ref,tokens)||ref||1);
+  const lim=Number(a.limit_tokens);
   const st=statusOf(a);
   const denom=lim>0?lim:1;
   const pct=tokens/denom*100;
@@ -304,13 +310,14 @@ function render(){
     return '<tr class="hover:bg-slate-50">'
       +'<td class="border-b border-slate-100 px-3 py-3 sm:px-4"><span class="cursor-copy border-b border-dashed border-transparent hover:border-brand hover:text-brand" data-copy="'+esc(a.email||'')+'" title="点击复制完整邮箱">'+esc(emailShow)+'</span></td>'
       +'<td class="border-b border-slate-100 px-3 py-3 sm:px-4">'+usageCell(a)+'</td>'
+      +'<td class="border-b border-slate-100 px-3 py-3 sm:px-4">'+historicalCell(a)+'</td>'
       +'<td class="border-b border-slate-100 px-3 py-3 sm:px-4">'+pctBar(a)+'</td>'
       +'<td class="border-b border-slate-100 px-3 py-3 sm:px-4"><span class="inline-flex rounded-full px-2.5 py-1 text-xs font-bold '+tagClass(kind)+'">'+esc(label)+'</span></td>'
       +'<td class="border-b border-slate-100 px-3 py-3 tabular-nums sm:px-4">'+esc(recover)+'</td>'
       +'<td class="border-b border-slate-100 px-3 py-3 sm:px-4"><div class="line-clamp-2 text-xs leading-snug text-ink-muted md:text-sm" title="'+esc(note)+'">'+esc(note)+'</div></td>'
       +'<td class="border-b border-slate-100 px-3 py-3 sm:px-4">'+act+'</td>'
       +'</tr>';
-  }).join('')||'<tr><td colspan="7" class="px-4 py-10 text-center text-ink-muted">没有匹配的账号</td></tr>';
+  }).join('')||'<tr><td colspan="8" class="px-4 py-10 text-center text-ink-muted">没有匹配的账号</td></tr>';
 
   document.querySelectorAll('[data-copy]').forEach(el=>{
     el.onclick=()=>copyText(el.getAttribute('data-copy'));

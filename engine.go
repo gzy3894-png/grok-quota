@@ -15,28 +15,25 @@ import (
 )
 
 const (
-	// defaultReferenceTokens is only a UI/reference baseline for free-tier
-	// observation. It is NOT a hard account cap and never truncates usage.
+	// defaultReferenceTokens is ONLY an unconfirmed UI baseline before any
+	// free-usage-exhausted log records that account's official limit.
+	// It must never be treated as every account's real cap.
 	defaultReferenceTokens int64 = 2_000_000
 	defaultWindow                = 24 * time.Hour
 	xaiProvider                  = "xai"
 	sourceRolling                = "cpamp_usage_events_rolling_24h"
+	limitSourceObserved          = "cpamp_free_usage_exhausted_actual_at_exhaust"
+	limitSourceFallback          = "cpamp_free_usage_exhausted_limit_fallback"
+	limitSourceUnknown           = "none_no_free_usage_exhaust_log"
 )
 
-// dynamicLimit returns the display ceiling for an account:
-// max(reference, real 24h usage). Usage is never capped for recording.
-func dynamicLimit(tokens24h, reference int64) int64 {
-	if reference <= 0 {
-		reference = defaultReferenceTokens
-	}
-	if tokens24h < 0 {
-		tokens24h = 0
-	}
-	if tokens24h > reference {
-		return tokens24h
-	}
-	return reference
-}
+// Official free-usage errors embed:
+//
+//	tokens (actual/limit): 2117440/2000000
+//
+// The plugin must parse limit and permanently treat it as that account's ceiling
+// until a later exhaust event reports a different (usually same) limit.
+var actualLimitRE = regexp.MustCompile(`(?i)tokens\s*\(actual/limit\)\s*:\s*([\d,]+)\s*/\s*([\d,]+)`)
 
 var (
 	quotaCodeRE = regexp.MustCompile(`(?i)(free-usage-exhausted|spending-limit|out of credits|personal-team-blocked:spending-limit|resource[_ ]?exhausted|insufficient.?credits|quota exceeded|quota_exceeded)`)
@@ -45,32 +42,187 @@ var (
 	plainRateLimitRE = regexp.MustCompile(`(?i)rate[\s_-]?limit`)
 )
 
+// observedOfficialLimit is the latest confirmed free-tier exhaustion record for
+// one identity. Actual is the dynamic ceiling for the next recovery cycle.
+type observedOfficialLimit struct {
+	Limit     int64
+	Actual    int64
+	At        time.Time
+	AuthIndex string
+	Email     string
+	AuthFile  string
+}
+
+// parseOfficialActualLimit extracts actual/limit from free-usage error text.
+func parseOfficialActualLimit(blob string) (actual, limit int64, ok bool) {
+	m := actualLimitRE.FindStringSubmatch(blob)
+	if len(m) != 3 {
+		return 0, 0, false
+	}
+	actual = parseIntComma(m[1])
+	limit = parseIntComma(m[2])
+	if limit <= 0 {
+		return 0, 0, false
+	}
+	return actual, limit, true
+}
+
+func parseIntComma(s string) int64 {
+	s = strings.ReplaceAll(strings.TrimSpace(s), ",", "")
+	var n int64
+	for _, ch := range s {
+		if ch < '0' || ch > '9' {
+			return 0
+		}
+		n = n*10 + int64(ch-'0')
+	}
+	return n
+}
+
+// upsertObservedLimit keeps the newest valid exhaustion event per identity.
+func upsertObservedLimit(dst map[string]observedOfficialLimit, key string, rec observedOfficialLimit) {
+	key = strings.TrimSpace(key)
+	if key == "" || rec.Limit <= 0 {
+		return
+	}
+	prev, ok := dst[key]
+	if !ok {
+		dst[key] = rec
+		return
+	}
+	if !rec.At.Before(prev.At) {
+		dst[key] = rec
+	}
+}
+
+// loadObservedOfficialLimits reads ALL free-usage-exhausted rows (not just 24h)
+// and keeps the most recent actual/limit record for each account identity.
+func loadObservedOfficialLimits(db *sql.DB) (byAuth, byEmail, byFile map[string]observedOfficialLimit, err error) {
+	byAuth = map[string]observedOfficialLimit{}
+	byEmail = map[string]observedOfficialLimit{}
+	byFile = map[string]observedOfficialLimit{}
+	rows, err := db.Query(`
+		SELECT timestamp_ms,
+			COALESCE(auth_index, ''),
+			COALESCE(auth_file_snapshot, ''),
+			COALESCE(account_snapshot, ''),
+			COALESCE(fail_summary, ''),
+			COALESCE(fail_body, '')
+		FROM usage_events
+		WHERE failed = 1
+		  AND auth_provider_snapshot = ?
+		  AND (
+		    fail_summary LIKE '%free-usage-exhausted%'
+		    OR fail_body LIKE '%free-usage-exhausted%'
+		  )
+		ORDER BY timestamp_ms ASC
+	`, xaiProvider)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var tsMS int64
+		var authIndex, authFile, account, summary, body string
+		if err := rows.Scan(&tsMS, &authIndex, &authFile, &account, &summary, &body); err != nil {
+			return nil, nil, nil, err
+		}
+		actual, limit, ok := parseOfficialActualLimit(summary + "\n" + body)
+		if !ok {
+			continue
+		}
+		rec := observedOfficialLimit{
+			Limit:     limit,
+			Actual:    actual,
+			At:        time.UnixMilli(tsMS).UTC(),
+			AuthIndex: strings.TrimSpace(authIndex),
+			Email:     strings.ToLower(deriveEmail(account, authFile)),
+			AuthFile:  filepath.Base(strings.TrimSpace(authFile)),
+		}
+		upsertObservedLimit(byAuth, rec.AuthIndex, rec)
+		upsertObservedLimit(byEmail, rec.Email, rec)
+		upsertObservedLimit(byFile, rec.AuthFile, rec)
+	}
+	return byAuth, byEmail, byFile, rows.Err()
+}
+
+func resolveObservedOfficialLimit(
+	authIndex, email, authFile string,
+	byAuth, byEmail, byFile map[string]observedOfficialLimit,
+) (observedOfficialLimit, bool) {
+	if byAuth != nil {
+		if rec, ok := byAuth[strings.TrimSpace(authIndex)]; ok {
+			return rec, true
+		}
+	}
+	email = strings.ToLower(strings.TrimSpace(email))
+	if byEmail != nil && email != "" {
+		if rec, ok := byEmail[email]; ok {
+			return rec, true
+		}
+	}
+	base := filepath.Base(strings.TrimSpace(authFile))
+	if byFile != nil && base != "" {
+		if rec, ok := byFile[base]; ok {
+			return rec, true
+		}
+	}
+	return observedOfficialLimit{}, false
+}
+
+// accountCeiling picks the dynamic display ceiling for remaining math.
+// The actual side of the latest exhaustion record wins; limit is only a
+// compatibility fallback for malformed legacy records. Unknown stays unknown.
+func accountCeiling(tokens24h int64, obs observedOfficialLimit, hasObs bool) (limit int64, mode, source string, overRef bool) {
+	if tokens24h < 0 {
+		tokens24h = 0
+	}
+	if hasObs && obs.Actual > 0 {
+		return obs.Actual, "observed", limitSourceObserved, tokens24h > defaultReferenceTokens
+	}
+	if hasObs && obs.Limit > 0 {
+		return obs.Limit, "observed", limitSourceFallback, tokens24h > defaultReferenceTokens
+	}
+	return 0, "unknown", limitSourceUnknown, tokens24h > defaultReferenceTokens
+}
+
+func int64Ptr(value int64) *int64 {
+	return &value
+}
+
+func float64Ptr(value float64) *float64 {
+	return &value
+}
+
 type accountQuota struct {
-	AuthIndex     string  `json:"auth_index"`
-	Email         string  `json:"email,omitempty"`
-	AuthFile      string  `json:"auth_file,omitempty"`
-	Tokens24h     int64   `json:"tokens_24h"`
-	Tokens24hM    string  `json:"tokens_24h_m"`
-	Success24h    int64   `json:"success_24h"`
-	Failed24h     int64   `json:"failed_24h"`
-	LimitTokens   int64   `json:"limit_tokens"`
-	LimitTokensM  string  `json:"limit_tokens_m"`
-	Remaining     int64   `json:"remaining_tokens"`
-	RemainingM    string  `json:"remaining_tokens_m"`
-	Pct           float64 `json:"pct"`
-	Window        string  `json:"window"`
-	Health        string  `json:"health"`
-	HealthLabel   string  `json:"health_label"`
-	Reason        string  `json:"reason,omitempty"`
-	ReasonLabel   string  `json:"reason_label,omitempty"`
-	FailureAt     string  `json:"failure_at,omitempty"`
-	FailureAtCN   string  `json:"failure_at_cn,omitempty"`
-	RecoverAt     string  `json:"recover_at,omitempty"`
-	RecoverAtCN   string  `json:"recover_at_cn,omitempty"`
-	StatusCode    int     `json:"status_code,omitempty"`
-	Source        string  `json:"source"`
-	LastUsageAt   string  `json:"last_usage_at,omitempty"`
-	LastUsageAtCN string  `json:"last_usage_at_cn,omitempty"`
+	AuthIndex         string   `json:"auth_index"`
+	Email             string   `json:"email,omitempty"`
+	AuthFile          string   `json:"auth_file,omitempty"`
+	Tokens24h         int64    `json:"tokens_24h"`
+	Tokens24hM        string   `json:"tokens_24h_m"`
+	Success24h        int64    `json:"success_24h"`
+	Failed24h         int64    `json:"failed_24h"`
+	LimitTokens       *int64   `json:"limit_tokens"`
+	LimitTokensM      string   `json:"limit_tokens_m"`
+	Remaining         *int64   `json:"remaining_tokens"`
+	RemainingM        string   `json:"remaining_tokens_m"`
+	Pct               *float64 `json:"pct"`
+	HistoricalTokens  int64    `json:"historical_tokens"`
+	HistoricalTokensM string   `json:"historical_tokens_m"`
+	Window            string   `json:"window"`
+	Health            string   `json:"health"`
+	HealthLabel       string   `json:"health_label"`
+	Reason            string   `json:"reason,omitempty"`
+	ReasonLabel       string   `json:"reason_label,omitempty"`
+	FailureAt         string   `json:"failure_at,omitempty"`
+	FailureAtCN       string   `json:"failure_at_cn,omitempty"`
+	RecoverAt         string   `json:"recover_at,omitempty"`
+	RecoverAtCN       string   `json:"recover_at_cn,omitempty"`
+	StatusCode        int      `json:"status_code,omitempty"`
+	Source            string   `json:"source"`
+	LastUsageAt       string   `json:"last_usage_at,omitempty"`
+	LastUsageAtCN     string   `json:"last_usage_at_cn,omitempty"`
 	// SoftExhausted is deprecated: local rolling usage alone never marks full.
 	// Kept for API compatibility; always false for new snapshots.
 	SoftExhausted bool `json:"soft_exhausted"`
@@ -85,21 +237,28 @@ type accountQuota struct {
 	Remark string `json:"remark,omitempty"`
 	// StatusKind is a single filter-friendly code for the console.
 	// active | disabled | quota_issue | high_usage
-	StatusKind      string `json:"status_kind,omitempty"`
-	StatusLabel     string `json:"status_label,omitempty"`
+	StatusKind  string `json:"status_kind,omitempty"`
+	StatusLabel string `json:"status_label,omitempty"`
 	// Masked display fields (full Email/AuthFile remain for copy & panel join).
 	EmailMasked    string `json:"email_masked,omitempty"`
 	AuthFileMasked string `json:"auth_file_masked,omitempty"`
-	// ShowReference is false when usage already exceeds the 2M baseline —
-	// UI should only show the dynamic ceiling then.
+	// ShowReference is retained for API compatibility. New snapshots do not use a
+	// default reference as a per-account ceiling.
 	ShowReference bool `json:"show_reference"`
-	// ReferenceTokens is the baseline (default 2M), not an official cap.
+	// ReferenceTokens is the unconfirmed baseline (default 2M), not an official cap.
 	ReferenceTokens  int64  `json:"reference_tokens"`
 	ReferenceTokensM string `json:"reference_tokens_m,omitempty"`
 	// PctOfReference can exceed 100 when real usage is above the baseline.
 	PctOfReference float64 `json:"pct_of_reference"`
-	// LimitMode: reference | dynamic | exhausted
+	// LimitMode: unknown | observed (from free-usage log) | exhausted.
 	LimitMode string `json:"limit_mode,omitempty"`
+	// LimitSource explains how limit_tokens was chosen.
+	LimitSource string `json:"limit_source,omitempty"`
+	// LimitObservedAt is when free-usage-exhausted last reported this official limit.
+	LimitObservedAt   string `json:"limit_observed_at,omitempty"`
+	LimitObservedAtCN string `json:"limit_observed_at_cn,omitempty"`
+	// LimitActualAtExhaust is the "actual" side of tokens (actual/limit) when observed.
+	LimitActualAtExhaust int64 `json:"limit_actual_at_exhaust,omitempty"`
 
 	SchedulerOwner   string `json:"scheduler_owner,omitempty"`
 	GlobalStatusKind string `json:"global_status_kind,omitempty"`
@@ -111,63 +270,63 @@ type accountQuota struct {
 	MembershipKey string `json:"membership_key,omitempty"`
 
 	// Panel-facing aliases. quota_used is always real rolling usage (uncapped).
-	QuotaLimit       int64  `json:"quota_limit"`
+	QuotaLimit       *int64 `json:"quota_limit"`
 	QuotaUsed        int64  `json:"quota_used"`
-	QuotaRemaining   int64  `json:"quota_remaining"`
+	QuotaRemaining   *int64 `json:"quota_remaining"`
 	QuotaHealth      string `json:"quota_health"`
 	QuotaWindowStart string `json:"quota_window_start,omitempty"`
 	QuotaFailureAt   string `json:"quota_failure_at,omitempty"`
-	CooldownUntil     string `json:"cooldown_until,omitempty"`
+	CooldownUntil    string `json:"cooldown_until,omitempty"`
 	QuotaReason      string `json:"quota_reason,omitempty"`
 }
 
 type quotaSnapshot struct {
-	Plugin         string         `json:"plugin"`
-	Version        string         `json:"version"`
-	ComputedAt     string         `json:"computed_at"`
-	ComputedAtCN   string         `json:"computed_at_cn"`
-	Timezone       string         `json:"timezone"`
-	AsOfMS         int64          `json:"as_of_ms"`
-	WindowHours    int            `json:"window_hours"`
-	LimitTokens    int64          `json:"limit_tokens"`
-	DBPath         string         `json:"db_path"`
-	Source         string         `json:"source"`
-	Note           string         `json:"note"`
-	Summary        quotaSummary   `json:"summary"`
-	Accounts       []accountQuota `json:"accounts"`
-	ByAuthIndex    map[string]accountQuota `json:"by_auth_index,omitempty"`
-	SchedulerSync  map[string]any `json:"scheduler_sync,omitempty"`
-	Error          string         `json:"error,omitempty"`
+	Plugin        string                  `json:"plugin"`
+	Version       string                  `json:"version"`
+	ComputedAt    string                  `json:"computed_at"`
+	ComputedAtCN  string                  `json:"computed_at_cn"`
+	Timezone      string                  `json:"timezone"`
+	AsOfMS        int64                   `json:"as_of_ms"`
+	WindowHours   int                     `json:"window_hours"`
+	LimitTokens   int64                   `json:"limit_tokens"`
+	DBPath        string                  `json:"db_path"`
+	Source        string                  `json:"source"`
+	Note          string                  `json:"note"`
+	Summary       quotaSummary            `json:"summary"`
+	Accounts      []accountQuota          `json:"accounts"`
+	ByAuthIndex   map[string]accountQuota `json:"by_auth_index,omitempty"`
+	SchedulerSync map[string]any          `json:"scheduler_sync,omitempty"`
+	Error         string                  `json:"error,omitempty"`
 }
 
 type quotaSummary struct {
-	AccountCount            int    `json:"account_count"`
-	ActiveAccounts          int    `json:"active_accounts"`
-	DisabledAccounts        int    `json:"disabled_accounts"`
-	CooldownAccounts        int    `json:"cooldown_accounts"` // log-proven quota issues still in recover window
-	QuotaIssueAccounts      int    `json:"quota_issue_accounts"`
-	SuggestDisableAccounts  int    `json:"suggest_disable_accounts"`
-	HighUsageAccounts       int    `json:"high_usage_accounts"` // over reference, no log issue
+	AccountCount           int `json:"account_count"`
+	ActiveAccounts         int `json:"active_accounts"`
+	DisabledAccounts       int `json:"disabled_accounts"`
+	CooldownAccounts       int `json:"cooldown_accounts"` // log-proven quota issues still in recover window
+	QuotaIssueAccounts     int `json:"quota_issue_accounts"`
+	SuggestDisableAccounts int `json:"suggest_disable_accounts"`
+	HighUsageAccounts      int `json:"high_usage_accounts"` // over reference, no log issue
 	// SoftExhaustedAccounts deprecated; always 0 (local 2M alone is not exhaustion).
-	SoftExhaustedAccounts   int    `json:"soft_exhausted_accounts"`
-	UsedTokens              int64  `json:"used_tokens"`
-	UsedTokensM             string `json:"used_tokens_m"`
+	SoftExhaustedAccounts int    `json:"soft_exhausted_accounts"`
+	UsedTokens            int64  `json:"used_tokens"`
+	UsedTokensM           string `json:"used_tokens_m"`
 	// MaximumTokens is sum of per-account dynamic display ceilings (not N*2M hard cap).
-	MaximumTokens           int64  `json:"maximum_tokens"`
-	MaximumTokensM          string `json:"maximum_tokens_m"`
+	MaximumTokens  int64  `json:"maximum_tokens"`
+	MaximumTokensM string `json:"maximum_tokens_m"`
 	// CurrentAvailableTokens is sum of display remaining vs dynamic ceilings.
-	CurrentAvailableTokens  int64  `json:"current_available_tokens"`
-	CurrentAvailableTokensM string `json:"current_available_tokens_m"`
-	ReferenceTokens         int64  `json:"reference_tokens"`
-	ReferenceTokensM        string `json:"reference_tokens_m,omitempty"`
-	Window                  string `json:"window"`
-	WindowLabel             string `json:"window_label"`
-	Source                  string `json:"source"`
-	AuthDir                 string `json:"auth_dir,omitempty"`
-	MembershipSource        string `json:"membership_source,omitempty"`
-	DroppedHistorical       int    `json:"dropped_historical_accounts,omitempty"`
-	AutoDisableEnabled      bool   `json:"auto_disable_enabled"`
-	AutoDisabledNow         int    `json:"auto_disabled_now,omitempty"`
+	CurrentAvailableTokens  int64    `json:"current_available_tokens"`
+	CurrentAvailableTokensM string   `json:"current_available_tokens_m"`
+	ReferenceTokens         int64    `json:"reference_tokens"`
+	ReferenceTokensM        string   `json:"reference_tokens_m,omitempty"`
+	Window                  string   `json:"window"`
+	WindowLabel             string   `json:"window_label"`
+	Source                  string   `json:"source"`
+	AuthDir                 string   `json:"auth_dir,omitempty"`
+	MembershipSource        string   `json:"membership_source,omitempty"`
+	DroppedHistorical       int      `json:"dropped_historical_accounts,omitempty"`
+	AutoDisableEnabled      bool     `json:"auto_disable_enabled"`
+	AutoDisabledNow         int      `json:"auto_disabled_now,omitempty"`
 	MetaLines               []string `json:"meta_lines,omitempty"`
 }
 
@@ -179,6 +338,13 @@ type usageAgg struct {
 	success24h int64
 	failed24h  int64
 	lastUsage  time.Time
+}
+
+type historicalUsageAgg struct {
+	authIndex string
+	email     string
+	authFile  string
+	tokens    int64
 }
 
 type coolingAgg struct {
@@ -440,6 +606,44 @@ func loadRollingUsage(db *sql.DB, now time.Time, window time.Duration) (map[stri
 	return out, rows.Err()
 }
 
+// loadHistoricalUsage sums every successful event retained in usage_events.
+// It is display-only and never participates in quota ceilings or cooldowns.
+func loadHistoricalUsage(db *sql.DB) (map[string]historicalUsageAgg, error) {
+	rows, err := db.Query(`
+		SELECT auth_index,
+			COALESCE(MAX(auth_file_snapshot), ''),
+			COALESCE(MAX(account_snapshot), ''),
+			COALESCE(SUM(CASE WHEN failed = 0 THEN total_tokens ELSE 0 END), 0)
+		FROM usage_events
+		WHERE auth_provider_snapshot = ?
+		GROUP BY auth_index
+	`, xaiProvider)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]historicalUsageAgg{}
+	for rows.Next() {
+		var authIndex, authFile, account string
+		var tokens int64
+		if err := rows.Scan(&authIndex, &authFile, &account, &tokens); err != nil {
+			return nil, err
+		}
+		authIndex = strings.TrimSpace(authIndex)
+		if authIndex == "" {
+			continue
+		}
+		out[authIndex] = historicalUsageAgg{
+			authIndex: authIndex,
+			email:     deriveEmail(account, authFile),
+			authFile:  filepath.Base(strings.TrimSpace(authFile)),
+			tokens:    tokens,
+		}
+	}
+	return out, rows.Err()
+}
+
 func loadActiveCoolings(db *sql.DB, now time.Time, lookback time.Duration) (map[string]coolingAgg, error) {
 	sinceMS := now.Add(-lookback).UnixMilli()
 	rows, err := db.Query(`
@@ -526,15 +730,18 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 		LimitTokens:  defaultReferenceTokens, // snapshot-level baseline only
 		DBPath:       dbPath,
 		Source:       sourceRolling,
-		Note:         "日志观测，非 xAI 官方余额。仅当 usage_events 出现额度错误码时才标记额度问题；2M 为参考基线，超线后按真实用量动态抬升上限。",
+		Note: "日志观测，非 xAI 官方余额 API。" +
+			"tokens_24h=近24h滚动成功用量。" +
+			"2M 仅为未观测时的参考基线；当 free-usage-exhausted 日志出现 tokens (actual/limit) 时，" +
+			"自动以 actual 作为该号下一周期动态上限，并用 actual-tokens_24h 估算剩余。",
 		Summary: quotaSummary{
-			Window:           "rolling_24h",
-			WindowLabel:      "近 24 小时滚动",
-			Source:           sourceRolling,
-			AuthDir:          authDir,
-			MembershipSource: "cpa_auth_dir",
-			ReferenceTokens:  defaultReferenceTokens,
-			ReferenceTokensM: formatTokensM(defaultReferenceTokens),
+			Window:             "rolling_24h",
+			WindowLabel:        "近 24 小时滚动",
+			Source:             sourceRolling,
+			AuthDir:            authDir,
+			MembershipSource:   "cpa_auth_dir",
+			ReferenceTokens:    defaultReferenceTokens,
+			ReferenceTokensM:   formatTokensM(defaultReferenceTokens),
 			AutoDisableEnabled: cfg.AutoDisableQuotaExhausted,
 		},
 		Accounts: []accountQuota{},
@@ -552,7 +759,11 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 	usePool := poolErr == nil && len(pool) > 0
 
 	var usage map[string]usageAgg
+	var historical map[string]historicalUsageAgg
 	var cooling map[string]coolingAgg
+	obsByAuth := map[string]observedOfficialLimit{}
+	obsByEmail := map[string]observedOfficialLimit{}
+	obsByFile := map[string]observedOfficialLimit{}
 	if dbPath != "" {
 		db, err := openUsageDB(dbPath)
 		if err != nil {
@@ -564,12 +775,28 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 			if err != nil {
 				snap.Error = "rolling usage: " + err.Error()
 			}
+			historical, err = loadHistoricalUsage(db)
+			if err != nil {
+				if snap.Error != "" {
+					snap.Error += "; "
+				}
+				snap.Error += "historical usage: " + err.Error()
+			}
 			cooling, err = loadActiveCoolings(db, now, 48*time.Hour)
 			if err != nil {
 				if snap.Error != "" {
 					snap.Error += "; "
 				}
 				snap.Error += "cooling: " + err.Error()
+			}
+			// Official per-account ceilings: full history of free-usage actual/limit.
+			var oerr error
+			obsByAuth, obsByEmail, obsByFile, oerr = loadObservedOfficialLimits(db)
+			if oerr != nil {
+				if snap.Error != "" {
+					snap.Error += "; "
+				}
+				snap.Error += "observed limits: " + oerr.Error()
 			}
 		}
 	} else if !usePool {
@@ -578,6 +805,9 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 	}
 	if usage == nil {
 		usage = map[string]usageAgg{}
+	}
+	if historical == nil {
+		historical = map[string]historicalUsageAgg{}
 	}
 	if cooling == nil {
 		cooling = map[string]coolingAgg{}
@@ -600,6 +830,7 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 
 	// Remap usage/cooling onto live membership keys (email/file join).
 	usageByLive := map[string]usageAgg{}
+	historicalByLive := map[string]int64{}
 	coolingByLive := map[string]coolingAgg{}
 	dropped := 0
 	for authIndex, u := range usage {
@@ -616,6 +847,15 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 			continue
 		}
 		usageByLive[authIndex] = u
+	}
+	for authIndex, h := range historical {
+		if usePool {
+			if key, ok := matchLiveKey(authIndex, h.email, h.authFile, pool, byEmail, byFile); ok {
+				historicalByLive[key] += h.tokens
+			}
+			continue
+		}
+		historicalByLive[authIndex] += h.tokens
 	}
 	for authIndex, c := range cooling {
 		if strings.HasPrefix(authIndex, "file:") {
@@ -727,21 +967,46 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 		if tokens < 0 {
 			tokens = 0
 		}
+		historicalTokens := historicalByLive[s.key]
+		// Official ceiling is learned ONLY from free-usage-exhausted logs
+		// (tokens actual/limit). Never assume every account is 2M.
+		obs, hasObs := resolveObservedOfficialLimit(displayIndex, email, authFile, obsByAuth, obsByEmail, obsByFile)
+		if !hasObs {
+			// Retry with usage/cooling identity keys (auth_index may differ).
+			obs, hasObs = resolveObservedOfficialLimit(u.authIndex, email, authFile, obsByAuth, obsByEmail, obsByFile)
+		}
+		if !hasObs && cool {
+			obs, hasObs = resolveObservedOfficialLimit(c.authIndex, c.email, c.authFile, obsByAuth, obsByEmail, obsByFile)
+		}
+		ceiling, limMode, limSource, overRef := accountCeiling(tokens, obs, hasObs)
+
 		acc := accountQuota{
-			AuthIndex:       displayIndex,
-			Email:           email,
-			AuthFile:        authFile,
-			Tokens24h:       tokens,
-			Success24h:      u.success24h,
-			Failed24h:       u.failed24h,
-			ReferenceTokens: defaultReferenceTokens,
-			Window:          "rolling_24h",
-			Source:          sourceRolling,
-			Health:          "healthy",
-			SoftExhausted:   false, // never mark "full" from local 2M alone
-			InPool:          s.inPool,
-			AuthDisabled:    s.disabled,
-			MembershipKey:   s.key,
+			AuthIndex:        displayIndex,
+			Email:            email,
+			AuthFile:         authFile,
+			Tokens24h:        tokens,
+			Success24h:       u.success24h,
+			Failed24h:        u.failed24h,
+			ReferenceTokens:  defaultReferenceTokens,
+			LimitMode:        limMode,
+			LimitSource:      limSource,
+			OverReference:    overRef,
+			HistoricalTokens: historicalTokens,
+			Window:           "rolling_24h",
+			Source:           sourceRolling,
+			Health:           "healthy",
+			SoftExhausted:    false, // never mark "full" from local 2M alone
+			InPool:           s.inPool,
+			AuthDisabled:     s.disabled,
+			MembershipKey:    s.key,
+			QuotaUsed:        tokens,
+		}
+		if ceiling > 0 {
+			acc.LimitTokens = int64Ptr(ceiling)
+		}
+		if hasObs {
+			acc.LimitObservedAt = obs.At.Format(time.RFC3339Nano)
+			acc.LimitActualAtExhaust = obs.Actual
 		}
 		if s.disabled {
 			acc.PoolStatus = "disabled"
@@ -765,44 +1030,48 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 			acc.SchedulerOwner = "quota-enforcer-v1"
 			acc.GlobalStatusKind = "quota_cooldown"
 			acc.LimitMode = "exhausted"
-			// Display ceiling follows real usage; never invent a fake 2M used.
-			acc.LimitTokens = dynamicLimit(tokens, defaultReferenceTokens)
-			acc.Remaining = 0
-			acc.Pct = 100
-			acc.QuotaUsed = tokens
-			acc.ShowReference = tokens <= defaultReferenceTokens
+			if acc.LimitTokens != nil {
+				// Cooldown only means remaining is zero. Progress must continue to
+				// describe rolling usage against the dynamic exhaustion ceiling.
+				acc.Remaining = int64Ptr(0)
+				acc.Pct = float64Ptr(float64(tokens) / float64(*acc.LimitTokens) * 100)
+			}
 			// Suggest whenever logs prove quota exhaustion and the file is still enabled.
 			// Auto-disable (optional) still only writes live pool files.
 			if !s.disabled {
 				acc.SuggestDisable = true
 				acc.ActionHint = "日志含额度错误，建议停用"
-				acc.Remark = "近 24h 日志出现额度失败（如免费额度用尽/消费限额），建议停用该凭证；恢复时间见右侧。"
+				if hasObs {
+					acc.Remark = fmt.Sprintf(
+						"日志额度耗尽；下一周期动态上限取本次实际耗尽用量 %s。恢复时间见右侧。",
+						formatTokensM(ceiling),
+					)
+				} else {
+					acc.Remark = "近 24h 日志出现额度失败（如免费额度用尽/消费限额），但错误正文未解析到 tokens (actual/limit)，动态上限未知。建议停用该凭证。"
+				}
 			} else {
 				acc.ActionHint = "已停用"
 				acc.Remark = "凭证已停用；历史日志仍含额度失败记录。"
 			}
 		} else {
-			// Healthy: record real usage; grow display limit with usage so the
-			// bar never pretends "stopped at 2M".
-			acc.LimitTokens = dynamicLimit(tokens, defaultReferenceTokens)
-			if tokens > defaultReferenceTokens {
-				acc.OverReference = true
-				acc.LimitMode = "dynamic"
-				acc.ShowReference = false // hide 2M baseline once exceeded
-				acc.Remark = "近 24h 已超过 2M 参考线，日志无额度错误；可能仍可用，也可能上游已限流。请结合请求是否成功判断。"
-				acc.ActionHint = ""
+			if ceiling > 0 {
+				remaining := ceiling - tokens
+				if remaining < 0 {
+					remaining = 0
+				}
+				acc.Remaining = int64Ptr(remaining)
+				acc.Pct = float64Ptr(float64(tokens) / float64(ceiling) * 100)
+			}
+			if hasObs {
+				acc.Remark = fmt.Sprintf(
+					"动态上限取最近一次 free-usage-exhausted 的实际耗尽用量 %s；剩余≈上限−近24h用量。",
+					formatTokensM(ceiling),
+				)
+			} else if overRef {
+				acc.Remark = "近 24h 已超过 2M 参考线，但尚未有 free-usage-exhausted 的 actual/limit 记录，动态上限未知。"
 			} else {
-				acc.LimitMode = "reference"
-				acc.ShowReference = true
+				acc.Remark = "尚未观测到该号 free-usage 耗尽实际值；动态上限和剩余均未知。"
 			}
-			acc.Remaining = acc.LimitTokens - tokens
-			if acc.Remaining < 0 {
-				acc.Remaining = 0
-			}
-			if acc.LimitTokens > 0 {
-				acc.Pct = float64(tokens) / float64(acc.LimitTokens) * 100
-			}
-			acc.QuotaUsed = tokens
 		}
 		if defaultReferenceTokens > 0 {
 			acc.PctOfReference = float64(tokens) / float64(defaultReferenceTokens) * 100
@@ -853,8 +1122,12 @@ func buildSnapshot(dbPath string, now time.Time) quotaSnapshot {
 		// Real rolling usage only — never clamp to 2M.
 		if a.InPool {
 			usedSum += used
-			limitSum += a.LimitTokens
-			remainSum += a.Remaining
+			if a.LimitTokens != nil {
+				limitSum += *a.LimitTokens
+			}
+			if a.Remaining != nil {
+				remainSum += *a.Remaining
+			}
 		}
 		if a.Health == "cooldown" {
 			snap.Summary.CooldownAccounts++
@@ -925,12 +1198,19 @@ func buildMetaLines(snap quotaSnapshot) []string {
 	if mem == "" {
 		mem = "cpa_auth_dir"
 	}
+	observedN := 0
+	for _, a := range snap.Accounts {
+		if a.LimitMode == "observed" || a.LimitSource == limitSourceObserved {
+			observedN++
+		}
+	}
 	lines := []string{
 		fmt.Sprintf("成员：现网 auth-dir（%s）", mem),
 		"用量：CPAMP usage_events · 近 24 小时",
 		"时区：北京时间（UTC+8）",
 		fmt.Sprintf("统计：%s", snap.ComputedAtCN),
-		fmt.Sprintf("参考基线：%s/账号；超过后只显示动态上限", formatTokensM(defaultReferenceTokens)),
+		fmt.Sprintf("参考基线：%s/账号（未观测时占位，不是人人官方上限）", formatTokensM(defaultReferenceTokens)),
+		fmt.Sprintf("官方上限已观测：%d 账号（来自 free-usage tokens actual/limit）", observedN),
 	}
 	if s.DroppedHistorical > 0 {
 		lines = append(lines, fmt.Sprintf("已过滤历史账号：%d（不在现网 auth-dir）", s.DroppedHistorical))
@@ -946,7 +1226,10 @@ func buildMetaLines(snap quotaSnapshot) []string {
 	if snap.Error != "" {
 		lines = append(lines, "错误："+snap.Error)
 	}
-	lines = append(lines, "说明：非 xAI 官方余额；额度问题只看失败日志；邮箱默认脱敏，可复制全文。")
+	lines = append(lines,
+		"语义：号报 free-usage-exhausted 后解析 actual/limit 更新该号上限；剩余=上限−24h用量",
+		"说明：非 xAI 官方余额 API；额度问题只看失败日志；邮箱默认脱敏，可复制全文。",
+	)
 	return lines
 }
 

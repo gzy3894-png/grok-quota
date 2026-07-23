@@ -119,12 +119,22 @@ func enrichAccountDisplay(a *accountQuota) {
 	}
 	a.ReasonLabel = reasonLabelZH(a.Reason)
 	a.Tokens24hM = formatTokensM(a.Tokens24h)
-	a.LimitTokensM = formatTokensM(a.LimitTokens)
-	a.RemainingM = formatTokensM(a.Remaining)
+	if a.LimitTokens != nil {
+		a.LimitTokensM = formatTokensM(*a.LimitTokens)
+	} else {
+		a.LimitTokensM = "未知"
+	}
+	if a.Remaining != nil {
+		a.RemainingM = formatTokensM(*a.Remaining)
+	} else {
+		a.RemainingM = "未知"
+	}
+	a.HistoricalTokensM = formatTokensM(a.HistoricalTokens)
 	a.ReferenceTokensM = formatTokensM(a.ReferenceTokens)
 	a.FailureAtCN = formatTimeCN(a.FailureAt)
 	a.RecoverAtCN = formatTimeCN(a.RecoverAt)
 	a.LastUsageAtCN = formatTimeCN(a.LastUsageAt)
+	a.LimitObservedAtCN = formatTimeCN(a.LimitObservedAt)
 	a.EmailMasked = maskEmailDisplay(a.Email)
 	a.AuthFileMasked = maskAtAndAfter(a.AuthFile)
 	if a.ActionHint == "" && a.SuggestDisable {

@@ -2,7 +2,7 @@
 
 > **中文** | [English](README.en.md)
 
-[![Release](https://img.shields.io/badge/release-v0.1.9-blue)](https://github.com/gzy3894-png/grok-quota/releases/tag/v0.1.9)
+[![Release](https://img.shields.io/badge/release-v0.1.16-blue)](https://github.com/gzy3894-png/grok-quota/releases/tag/v0.1.16)
 [![CPA Plugin](https://img.shields.io/badge/CLIProxyAPI-plugin-111827)](https://github.com/router-for-me/CLIProxyAPI)
 [![Platform](https://img.shields.io/badge/platform-windows%20amd64-0f766e)](./README.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
@@ -22,7 +22,13 @@ Grok Quota 是一个给 [CLIProxyAPI（CPA）](https://github.com/router-for-me/
 
 Grok Quota 专门读本地 [CPAMP](https://github.com/router-for-me/CLIProxyAPI) / 用量库里的 `usage_events`，按 **滚动 24 小时**汇总成功请求的 token，并可选地合并全局账号状态总线（如 `account-status.json`）里的冷却信息，给面板做只读展示。
 
-默认把 `2,000,000 tokens / 24h` 当作**参考基线**。若账号真实用量到了 3M，动态上限就是 3M，进度条与统计都会如实显示——**绝不会因为到了 2M 就当成「本地已满」或停止记录。**
+默认把 `2,000,000 tokens / 24h` 当作**未观测时的参考基线**——**不是**假定每个号都是 2M 官方上限。
+
+**动态上限（核心）**：当日志出现 `free-usage-exhausted`，且正文含 `tokens (actual/limit): actual/limit` 时，插件**自动**把该号的 `limit_tokens` 更新为本次耗尽时的 `actual` 值，而不是原始 `limit`。例如 `1.2M/1M` 会在下一个恢复周期显示 `1.2M` 动态上限，并用：
+
+`剩余 ≈ 动态上限（actual） − 近 24h 成功用量`
+
+来估算可用量。未触发过 free-usage 的号，动态上限显示为「未知」；2M 仅是参考基线。真实用量始终完整记录，**绝不会因为到了 2M 就当成「本地已满」或停止记录。**
 
 **额度问题只认日志**：`free-usage-exhausted` / `spending-limit` 等错误码。可选开关「自动停用额度问题账号」（默认关）。
 
@@ -163,7 +169,7 @@ Panel 侧应优先使用 `quota_*` / `cooldown_until` 等别名字段，**不要
 | 项目 | 值 |
 | --- | --- |
 | 插件名 | `grok-quota` |
-| 版本 | `0.1.9` |
+| 版本 | `0.1.16` |
 | 角色 | QUERY（默认只读；可选自动停用） |
 | 主要平台 | Windows amd64（`.dll`） |
 | 许可证 | MIT |
